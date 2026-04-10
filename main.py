@@ -50,19 +50,24 @@ load_ai_model()
 
 # ===== Helpers =====
 def extract_features(data: dict) -> list:
-    """Extract and normalize features from telemetry data (Flat Structure)."""
+    """Extract and normalize features from telemetry data."""
+    target = data.get("target") or {}
+    config = data.get("config") or {}
+    anim = target.get("anim") or {}
+    vel = target.get("vel") or {}
+    
     return [
-        data.get("miss_streak", 0),
-        data.get("distance", 0),
-        data.get("velocity_x", 0),
-        data.get("velocity_y", 0),
-        data.get("goal_feet_yaw", 0),
-        data.get("eye_yaw", 0),
-        data.get("layer3_weight", 0),
-        data.get("layer3_cycle", 0),
-        data.get("relative_angle", 0),
-        data.get("choke", 0),
-        data.get("duck", 0)
+        config.get("miss_streak", 0),
+        config.get("distance", 0),
+        vel.get("x", 0),
+        vel.get("y", 0),
+        anim.get("goal_feet_yaw", 0),
+        anim.get("eye_yaw", 0),
+        anim.get("layer3_weight", 0),
+        anim.get("layer3_cycle", 0),
+        target.get("relative_angle", 0),
+        target.get("choke", 0),
+        target.get("duck", 0)
     ]
 
 # ===== API Endpoints =====
@@ -103,20 +108,25 @@ async def predict(request: Request):
 
     # Store the shot record for later outcome matching
     if supabase and shot_id:
+        target = data.get("target") or {}
+        config = data.get("config") or {}
+        anim = target.get("anim") or {}
+        vel = target.get("vel") or {}
+        
         try:
             db_payload = {
                 "shot_id": shot_id,
                 "timestamp": datetime.utcnow().isoformat(),
-                "velocity_x": data.get("velocity_x", 0),
-                "velocity_y": data.get("velocity_y", 0),
-                "goal_feet_yaw": data.get("goal_feet_yaw", 0),
-                "eye_yaw": data.get("eye_yaw", 0),
-                "layer3_weight": data.get("layer3_weight", 0),
-                "layer3_cycle": data.get("layer3_cycle", 0),
-                "relative_angle": data.get("relative_angle", 0),
-                "choked_ticks": data.get("choke", 0),
-                "duck_amount": data.get("duck", 0),
-                "miss_streak": data.get("miss_streak", 0),
+                "velocity_x": vel.get("x", 0),
+                "velocity_y": vel.get("y", 0),
+                "goal_feet_yaw": anim.get("goal_feet_yaw", 0),
+                "eye_yaw": anim.get("eye_yaw", 0),
+                "layer3_weight": anim.get("layer3_weight", 0),
+                "layer3_cycle": anim.get("layer3_cycle", 0),
+                "relative_angle": target.get("relative_angle", 0),
+                "choked_ticks": target.get("choke", 0),
+                "duck_amount": target.get("duck", 0),
+                "miss_streak": config.get("miss_streak", 0),
             }
             # We use background tasks or fire-and-forget for database ops to keep latency low
             threading.Thread(target=lambda: supabase.table("resolver_data").insert(db_payload).execute()).start()
@@ -163,19 +173,24 @@ async def analyze(request: Request):
         suggestion["override_baim"] = True
 
     if supabase:
+        target = data.get("target") or {}
+        config = data.get("config") or {}
+        anim = target.get("anim") or {}
+        vel = target.get("vel") or {}
+        
         try:
             db_payload = {
                 "timestamp": datetime.utcnow().isoformat(),
-                "velocity_x": data.get("velocity_x", 0),
-                "velocity_y": data.get("velocity_y", 0),
-                "goal_feet_yaw": data.get("goal_feet_yaw", 0),
-                "eye_yaw": data.get("eye_yaw", 0),
-                "layer3_weight": data.get("layer3_weight", 0),
-                "layer3_cycle": data.get("layer3_cycle", 0),
-                "relative_angle": data.get("relative_angle", 0),
-                "choked_ticks": data.get("choked_ticks", 0),
-                "duck_amount": data.get("duck_amount", 0),
-                "miss_streak": data.get("miss_streak", 0),
+                "velocity_x": vel.get("x", 0),
+                "velocity_y": vel.get("y", 0),
+                "goal_feet_yaw": anim.get("goal_feet_yaw", 0),
+                "eye_yaw": anim.get("eye_yaw", 0),
+                "layer3_weight": anim.get("layer3_weight", 0),
+                "layer3_cycle": anim.get("layer3_cycle", 0),
+                "relative_angle": target.get("relative_angle", 0),
+                "choked_ticks": target.get("choke", 0),
+                "duck_amount": target.get("duck", 0),
+                "miss_streak": config.get("miss_streak", 0),
             }
             threading.Thread(target=lambda: supabase.table("resolver_data").insert(db_payload).execute()).start()
         except: pass
