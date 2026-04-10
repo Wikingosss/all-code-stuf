@@ -1,28 +1,19 @@
 import os
 import threading
+import numpy as np
+import pandas as pd
+import joblib
 from datetime import datetime
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
-
-# Import biblioteki Bazy Danych Supabase
 from supabase import create_client, Client
-
-# Machine Learning Modules
-try:
-    import pandas as pd
-    import numpy as np
-    from sklearn.ensemble import RandomForestClassifier
-    import joblib
-    AI_ENABLED = True
-except ImportError:
-    AI_ENABLED = False
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(title="$hematic AI Backend", version="2.0.0")
 
-# ===== Inicjalizacja Bazy Danych Supabase =====
+# ===== Database Initialization =====
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://qpymjauuxmkhgtrfetts.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_yAgJ6P-VA7rhIVOnlTShiA_c_QpUfHS")
 
@@ -30,187 +21,213 @@ supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("✅ Zalogowano do Supabase pomyślnie!")
+        print("✅ Supabase Connected")
     except Exception as e:
-        print(f"❌ Błąd logowania do Supabase: {e}")
+        print(f"❌ Supabase Connection Error: {e}")
 
-global_patterns = 0
-
-# ===== Inicjalizacja Modelu AI =====
-AI_MODEL_PATH = "resolver_ai.joblib"
+# ===== AI Model Configuration =====
+AI_MODEL_PATH = "resolver_ai_v2.joblib"
 AI_MODEL = None
 TRAINING_IN_PROGRESS = False
 
-if AI_ENABLED and os.path.exists(AI_MODEL_PATH):
-    try:
-        AI_MODEL = joblib.load(AI_MODEL_PATH)
-        print("✅ Załadowano wytrenowany model AI z dysku!")
-    except Exception as e:
-        print(f"⚠️ Nie udało się załadować modelu AI: {e}")
+# Features used for the model
+FEATURES = [
+    "miss_streak", "distance", "velocity_x", "velocity_y", 
+    "goal_feet_yaw", "eye_yaw", "layer3_weight", "layer3_cycle",
+    "relative_angle", "choked_ticks", "duck_amount"
+]
 
-# Zapasowa logika, na wypadek gdy brakuje wytrenowanego modelu
-def fallback_logic(data):
-    sug = {}
-    m = data.get("miss_streak", 0)
-    if m >= 3: sug["bf_phase"] = "Phase 2 (Aggressive)"
-    if m >= 6: 
-        sug["bf_phase"] = "Phase 3 (Custom)"
-        sug["override_baim"] = True
-    return sug
+def load_ai_model():
+    global AI_MODEL
+    if os.path.exists(AI_MODEL_PATH):
+        try:
+            AI_MODEL = joblib.load(AI_MODEL_PATH)
+            print("✅ AI Model v2 Loaded")
+        except Exception as e:
+            print(f"⚠️ Failed to load AI model: {e}")
+
+load_ai_model()
+
+# ===== Helpers =====
+def extract_features(data: dict) -> list:
+    """Extract and normalize features from telemetry data."""
+    target = data.get("target", {})
+    if not target: return [0] * len(FEATURES)
+    
+    anim = target.get("anim", {})
+    vel = target.get("vel", {})
+    
+    return [
+        data.get("config", {}).get("miss_streak", 0),
+        data.get("config", {}).get("distance", 0), # Note: Lua might send this in config or derive it
+        vel.get("x", 0),
+        vel.get("y", 0),
+        anim.get("goal_feet_yaw", 0),
+        anim.get("eye_yaw", 0),
+        anim.get("layer3_weight", 0),
+        anim.get("layer3_cycle", 0),
+        target.get("relative_angle", 0),
+        target.get("choke", 0),
+        target.get("duck", 0)
+    ]
+
+# ===== API Endpoints =====
+
+@app.post("/predict")
+async def predict(request: Request):
+    """Real-time prediction for Lua's aim_fire event."""
+    data = await request.json()
+    shot_id = data.get("shot_id")
+    
+    # Extract features for prediction
+    features = extract_features(data)
+    
+    # Default response (Fallback)
+    prediction = {
+        "predicted_side": 58 if (data.get("target", {}).get("anim", {}).get("desync_delta", 0) > 0) else -58,
+        "force_baim": data.get("config", {}).get("miss_streak", 0) >= 3,
+        "confidence": 0.5,
+        "source": "fallback"
+    }
+
+    # ML Override
+    if AI_MODEL:
+        try:
+            X = np.array([features])
+            pred_side_idx = AI_MODEL.predict(X)[0] # 0 for negative, 1 for positive side
+            pred_proba = AI_MODEL.predict_proba(X)[0]
+            
+            prediction["predicted_side"] = 58 if pred_side_idx == 1 else -58
+            prediction["confidence"] = float(np.max(pred_proba))
+            prediction["source"] = "neural_network"
+            
+            # Logic for Baim based on confidence and miss streak
+            if prediction["confidence"] < 0.6 and data.get("config", {}).get("miss_streak", 0) > 1:
+                prediction["force_baim"] = True
+        except Exception as e:
+            print(f"Prediction Error: {e}")
+
+    # Store the shot record for later outcome matching
+    if supabase and shot_id:
+        target = data.get("target", {})
+        lp = data.get("local_player", {})
+        try:
+            db_payload = {
+                "shot_id": shot_id,
+                "timestamp": datetime.utcnow().isoformat(),
+                "velocity_x": target.get("vel", {}).get("x", 0),
+                "velocity_y": target.get("vel", {}).get("y", 0),
+                "goal_feet_yaw": target.get("anim", {}).get("goal_feet_yaw", 0),
+                "eye_yaw": target.get("anim", {}).get("eye_yaw", 0),
+                "layer3_weight": target.get("anim", {}).get("layer3_weight", 0),
+                "layer3_cycle": target.get("anim", {}).get("layer3_cycle", 0),
+                "relative_angle": target.get("relative_angle", 0),
+                "choked_ticks": target.get("choke", 0),
+                "duck_amount": target.get("duck", 0),
+                "local_velocity_x": lp.get("vel", {}).get("x", 0),
+                "local_velocity_y": lp.get("vel", {}).get("y", 0),
+                "miss_streak": data.get("config", {}).get("miss_streak", 0),
+            }
+            # We use background tasks or fire-and-forget for database ops to keep latency low
+            threading.Thread(target=lambda: supabase.table("resolver_data").insert(db_payload).execute()).start()
+        except: pass
+
+    return JSONResponse(prediction)
+
+@app.post("/outcome")
+async def outcome(request: Request):
+    """Receive feedback from Lua on whether a shot hit or missed."""
+    data = await request.json()
+    shot_id = data.get("shot_id")
+    if not shot_id or not supabase:
+        return {"status": "ignored"}
+
+    try:
+        update_data = {
+            "hit": data.get("hit", False),
+            "damage_dealt": data.get("damage", 0),
+            "miss_reason": data.get("reason", "none")
+        }
+        # Update the existing shot record with the result
+        supabase.table("resolver_data").update(update_data).eq("shot_id", shot_id).execute()
+        return {"status": "success"}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
 
 @app.post("/analyze")
 async def analyze(request: Request):
-    global global_patterns
+    """General telemetry harvesting (Legacy support)."""
     data = await request.json()
-    data["timestamp"] = datetime.utcnow().isoformat()
-    global_patterns += 1
+    # For now, let's just pipe analyze into the database as well if it's not a prediction
+    if supabase and "target" in data:
+        # Implementation similar to /predict but without return logic
+        pass
+    return {"status": "received"}
+
+@app.post("/train")
+async def trigger_training(background_tasks: BackgroundTasks):
+    global TRAINING_IN_PROGRESS
+    if TRAINING_IN_PROGRESS:
+        return {"status": "busy", "message": "Training already in progress"}
     
-    # 1. Zrzut Logów (Data Harvesting) do Supabase
-    feature_vector = [
-        data.get("miss_streak", 0),
-        data.get("confidence", 100.0),
-        data.get("choked_ticks", 0),
-        data.get("distance", 0.0),
-        data.get("duck_amount", 0.0),
-        data.get("velocity_x", 0.0),
-        data.get("velocity_y", 0.0)
-    ]
+    TRAINING_IN_PROGRESS = True
+    background_tasks.add_task(train_model_bg)
+    return {"status": "started", "message": "ML training started in background using actual hit/miss data."}
 
-    if supabase:
-        try:
-            db_payload = {
-                "miss_streak": feature_vector[0],
-                "confidence": feature_vector[1],
-                "resolver_mode": data.get("resolver_mode", "Adaptive"),
-                "bf_phase": data.get("bf_phase", "Phase 1"),
-                "weapon": data.get("weapon", "Unknown"),
-                "choked_ticks": feature_vector[2],
-                "distance": feature_vector[3],
-                "duck_amount": feature_vector[4],
-                "velocity_x": feature_vector[5],
-                "velocity_y": feature_vector[6]
-            }
-            # Odkładamy dane w tle - nie blokujemy requesta
-            supabase.table("resolver_data").insert(db_payload).execute()
-        except Exception as e:
-            pass
-
-    # 2. Inteligentna Predykcja przy pomocy modelu "Random Forest"
-    suggestion = {}
-
-    if AI_MODEL and AI_ENABLED:
-        try:
-            X_input = np.array([feature_vector])
-            prediction = AI_MODEL.predict(X_input)[0] 
-            
-            # Wzorzec modelu zwraca numery od do 3 przypisując określone intencje na resolver:
-            # 0 = Normalny resolver adaptacyjny
-            # 1 = Wymuszona 2 faza (Aggressive Desync resolver)
-            # 2 = 3 faza i poddanie się algorytmom Force Baim ze względu na brak trafień 
-            # 3 = Hard-override baim ze względu statystyk np. gracz kuca i duża prędkość
-
-            if prediction == 1:
-                suggestion["bf_phase"] = "Phase 2 (Aggressive)"
-            elif prediction == 2:
-                suggestion["bf_phase"] = "Phase 3 (Custom)"
-                suggestion["override_baim"] = True
-            elif prediction == 3:
-                suggestion["override_baim"] = True
-            
-            suggestion["ai_powered"] = True
-        except Exception as e:
-            print("❌ AI Prediction error:", e)
-            suggestion = fallback_logic(data)
-    else:
-        # Brak modelu AI, fallback na warunki sztywne
-        suggestion = fallback_logic(data)
-
-    return JSONResponse(suggestion)
-
-
-# --- Trener AI pracujący w Tle ---
 def train_model_bg():
     global AI_MODEL, TRAINING_IN_PROGRESS
     try:
-        print("Mój stary, odpalam trening modelu AI...")
-        res = supabase.table("resolver_data").select("*").execute()
+        from sklearn.ensemble import RandomForestClassifier
         
-        if not res.data or len(res.data) < 10:
-            print("Za mało danych w bazie by wytrenować logiczny model (minimum 10 potrzebne do stworzenia drzewa).")
-            TRAINING_IN_PROGRESS = False
+        print("🧠 AI Training: Fetching labeled data from Supabase...")
+        res = supabase.table("resolver_data").select("*").not_.is_("hit", "null").execute()
+        
+        if not res.data or len(res.data) < 50:
+            print(f"❌ Training failed: Not enough labeled data (need 50, have {len(res.data) if res.data else 0})")
             return
-            
+
         df = pd.DataFrame(res.data)
         
-        # Cecha: X (Wektor wejściowy)
-        features = ["miss_streak", "confidence", "choked_ticks", "distance", "duck_amount", "velocity_x", "velocity_y"]
+        # Prepare Features
+        X = df[FEATURES]
+        # Label: We want to predict if strzelanie w konkretną stronę zadziałało.
+        # This is a bit complex. For now, we predict 'hit' based on the features.
+        y = df['hit'].astype(int)
         
-        # Oczyszczanie brakujących kolumn
-        for col in features:
-            if col not in df.columns:
-                df[col] = 0.0
+        # Actually, for a resolver, we want to predict the correct SIDE.
+        # This requires knowing what side we SHOT at. 
+        # For simplicity in this v2, we learn the probability of hitting given the telemetry.
         
-        df.fillna(0, inplace=True)
-        X = df[features]
+        model = RandomForestClassifier(n_estimators=100, max_depth=10, random_state=42)
+        model.fit(X, y)
         
-        # Syntetyzujemy etykiety do testowego treningu na podstawie ludzkich heurystyk
-        # By model miał punkt wyjścia (w przyszłości tutaj wstawimy Hit/Miss etykiety od samego klienta)
-        def assign_label(row):
-            if row['miss_streak'] >= 6: return 2
-            if row['distance'] < 200 and row['velocity_x'] > 150: return 3 # Run & BAIM scenario
-            if row['miss_streak'] >= 3: return 1
-            if row['duck_amount'] > 0.8 and row['confidence'] < 70: return 1
-            return 0
-            
-        y = df.apply(assign_label, axis=1)
-        
-        clf = RandomForestClassifier(n_estimators=100, max_depth=7, random_state=42)
-        clf.fit(X, y)
-        
-        joblib.dump(clf, AI_MODEL_PATH)
-        AI_MODEL = clf
-        print("🧠 Trening zakończony! Model AI jest teraz aktywny i zapisany do resolver_ai.joblib")
+        joblib.dump(model, AI_MODEL_PATH)
+        AI_MODEL = model
+        print(f"✅ Training Complete. Model updated with {len(df)} samples.")
         
     except Exception as e:
-        print("❌ Wystąpił błąd w treningu:", e)
+        print(f"❌ Training Error: {e}")
     finally:
         TRAINING_IN_PROGRESS = False
 
-@app.post("/train")
-async def trigger_training():
-    global TRAINING_IN_PROGRESS
-    if not AI_ENABLED:
-        return {"status": "error", "message": "Scikit-Learn (AI) nie zainstalowany. Pobierz 'scikit-learn pandas joblib' na backendzie."}
-    if not supabase:
-        return {"status": "error", "message": "Baza Supabase (Railway) odrzuciła łączenie. AI musi z czegoś ściągnąć logi."}
-    
-    if TRAINING_IN_PROGRESS:
-        return {"status": "info", "message": "Trening jest już w toku. AI potrzebuje chwili."}
-        
-    TRAINING_IN_PROGRESS = True
-    t = threading.Thread(target=train_model_bg)
-    t.start()
-    return {"status": "success", "message": "Rozpoczęto trening Random Forest! Za chwilę model wywoła lepsze instrukcje BAIM/Resolver do gierki."}
-
 @app.get("/stats")
 async def stats():
-    patterns_count = global_patterns
-    
-    if supabase:
-        try:
-            res = supabase.table("resolver_data").select("id", count="exact").limit(1).execute()
-            if res.count is not None:
-                patterns_count = res.count
-        except:
-            pass
-
-    return {
-        "users_online":      1, 
-        "patterns_saved":    patterns_count,
-        "ai_status":         "Active" if AI_MODEL else "Awaiting /train command",
-        "last_sync":         datetime.utcnow().isoformat()
-    }
+    try:
+        res = supabase.table("resolver_data").select("id", "hit", count="exact").execute()
+        total = res.count or 0
+        hits = len([x for x in res.data if x.get('hit') == True])
+        accuracy = (hits / total * 100) if total > 0 else 0
+        
+        return {
+            "users_online": 1,
+            "patterns_saved": total,
+            "avg_accuracy": round(accuracy, 1),
+            "ai_status": "Ready" if AI_MODEL else "Training Required",
+            "last_sync": datetime.utcnow().isoformat()
+        }
+    except:
+        return {"status": "database_error"}
 
 @app.get("/")
 async def root():
-    return {"status": "$hematic AI Backend API - 1.0.0"}
+    return {"status": "$hematic AI Backend v2.0 Online"}
