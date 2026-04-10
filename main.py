@@ -53,7 +53,6 @@ def load_ai_model():
 
 load_ai_model()
 
-# ===== Helpers =====
 def extract_features(data: dict) -> list:
     """Extract and normalize features from telemetry data."""
     target = data.get("target") or {}
@@ -74,6 +73,15 @@ def extract_features(data: dict) -> list:
         target.get("choke", 0),
         target.get("duck", 0)
     ]
+
+def is_valid_telemetry(data: list) -> bool:
+    """Check if the provided features contain 'garbage' values (massive numbers)."""
+    # goal_feet_yaw (4), eye_yaw (5), relative_angle (8)
+    try:
+        if abs(data[4]) > 720 or abs(data[5]) > 720 or abs(data[8]) > 720:
+            return False
+    except: return False
+    return True
 
 # ===== API Endpoints =====
 
@@ -139,11 +147,13 @@ async def predict(request: Request):
         }
         
         try:
-            # Synchronous insert for direct error feedback to Lua console
-            supabase.table("resolver_data").insert(db_payload).execute()
+            # ONLY save to DB if telemetry is sane
+            if is_valid_telemetry(features):
+                supabase.table("resolver_data").insert(db_payload).execute()
+            else:
+                print(f"⚠️ Ignored garbage telemetry for shot {shot_id}")
         except Exception as e:
             print(f"🔥 Supabase Insert Error: {e}")
-            # Raising error here will return 500 to Lua, showing the error in game console
             raise e
 
     return JSONResponse(prediction)
@@ -211,7 +221,9 @@ async def analyze(request: Request):
         }
         
         try:
-            supabase.table("resolver_data").insert(db_payload).execute()
+            features = extract_features(data)
+            if is_valid_telemetry(features):
+                supabase.table("resolver_data").insert(db_payload).execute()
         except Exception as e:
             print(f"🔥 Supabase Sync Error: {e}")
             raise e
