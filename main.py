@@ -17,6 +17,11 @@ app = FastAPI(title="$hematic AI Backend", version="2.0.0")
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://qpymjauuxmkhgtrfetts.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_yAgJ6P-VA7rhIVOnlTShiA_c_QpUfHS")
 
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    print(f"🔥 Global Error: {exc}")
+    return JSONResponse(status_code=500, content={"message": str(exc)})
+
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
     try:
@@ -76,6 +81,7 @@ def extract_features(data: dict) -> list:
 async def predict(request: Request):
     """Real-time prediction for Lua's aim_fire event."""
     data = await request.json()
+    print(f"📥 Received Predict: {data}")
     shot_id = data.get("shot_id")
     
     # Extract features for prediction
@@ -173,6 +179,7 @@ async def analyze(request: Request):
     """General telemetry harvesting (Legacy & Flat support)."""
     global global_patterns
     data = await request.json()
+    print(f"📥 Received Analyze: {data}")
     global_patterns += 1
 
     suggestion = {
