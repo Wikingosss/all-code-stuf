@@ -1,6 +1,9 @@
 fastapi
 uvicorn
 supabase
-pandas
-scikit-learn
 python-dotenv
+pandas
+numpy
+scikit-learn
+joblib
+python-multipart
