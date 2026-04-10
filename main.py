@@ -26,8 +26,8 @@ app = FastAPI()
 # musisz wejść w zakładkę "Variables" i dodać dwa klucze:
 # 1. SUPABASE_URL (link URL bazy z ustawień supabase API)
 # 2. SUPABASE_KEY (anon key / public)
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://qpymjauuxmkhgtrfetts.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_yAgJ6P-VA7rhIVOnlTShiA_c_QpUfHS")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
