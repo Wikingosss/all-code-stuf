@@ -50,25 +50,19 @@ load_ai_model()
 
 # ===== Helpers =====
 def extract_features(data: dict) -> list:
-    """Extract and normalize features from telemetry data."""
-    target = data.get("target", {})
-    if not target: return [0] * len(FEATURES)
-    
-    anim = target.get("anim", {})
-    vel = target.get("vel", {})
-    
+    """Extract and normalize features from telemetry data (Flat Structure)."""
     return [
-        data.get("config", {}).get("miss_streak", 0),
-        data.get("config", {}).get("distance", 0), # Note: Lua might send this in config or derive it
-        vel.get("x", 0),
-        vel.get("y", 0),
-        anim.get("goal_feet_yaw", 0),
-        anim.get("eye_yaw", 0),
-        anim.get("layer3_weight", 0),
-        anim.get("layer3_cycle", 0),
-        target.get("relative_angle", 0),
-        target.get("choke", 0),
-        target.get("duck", 0)
+        data.get("miss_streak", 0),
+        data.get("distance", 0),
+        data.get("velocity_x", 0),
+        data.get("velocity_y", 0),
+        data.get("goal_feet_yaw", 0),
+        data.get("eye_yaw", 0),
+        data.get("layer3_weight", 0),
+        data.get("layer3_cycle", 0),
+        data.get("relative_angle", 0),
+        data.get("choke", 0),
+        data.get("duck", 0)
     ]
 
 # ===== API Endpoints =====
@@ -109,24 +103,20 @@ async def predict(request: Request):
 
     # Store the shot record for later outcome matching
     if supabase and shot_id:
-        target = data.get("target", {})
-        lp = data.get("local_player", {})
         try:
             db_payload = {
                 "shot_id": shot_id,
                 "timestamp": datetime.utcnow().isoformat(),
-                "velocity_x": target.get("vel", {}).get("x", 0),
-                "velocity_y": target.get("vel", {}).get("y", 0),
-                "goal_feet_yaw": target.get("anim", {}).get("goal_feet_yaw", 0),
-                "eye_yaw": target.get("anim", {}).get("eye_yaw", 0),
-                "layer3_weight": target.get("anim", {}).get("layer3_weight", 0),
-                "layer3_cycle": target.get("anim", {}).get("layer3_cycle", 0),
-                "relative_angle": target.get("relative_angle", 0),
-                "choked_ticks": target.get("choke", 0),
-                "duck_amount": target.get("duck", 0),
-                "local_velocity_x": lp.get("vel", {}).get("x", 0),
-                "local_velocity_y": lp.get("vel", {}).get("y", 0),
-                "miss_streak": data.get("config", {}).get("miss_streak", 0),
+                "velocity_x": data.get("velocity_x", 0),
+                "velocity_y": data.get("velocity_y", 0),
+                "goal_feet_yaw": data.get("goal_feet_yaw", 0),
+                "eye_yaw": data.get("eye_yaw", 0),
+                "layer3_weight": data.get("layer3_weight", 0),
+                "layer3_cycle": data.get("layer3_cycle", 0),
+                "relative_angle": data.get("relative_angle", 0),
+                "choked_ticks": data.get("choke", 0),
+                "duck_amount": data.get("duck", 0),
+                "miss_streak": data.get("miss_streak", 0),
             }
             # We use background tasks or fire-and-forget for database ops to keep latency low
             threading.Thread(target=lambda: supabase.table("resolver_data").insert(db_payload).execute()).start()
