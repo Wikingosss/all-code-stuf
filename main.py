@@ -108,29 +108,41 @@ async def predict(request: Request):
 
     # Store the shot record for later outcome matching
     if supabase and shot_id:
+        local_player = data.get("local_player") or {}
         target = data.get("target") or {}
         config = data.get("config") or {}
         anim = target.get("anim") or {}
         vel = target.get("vel") or {}
         
-        try:
-            db_payload = {
-                "shot_id": shot_id,
-                "timestamp": datetime.utcnow().isoformat(),
-                "velocity_x": vel.get("x", 0),
-                "velocity_y": vel.get("y", 0),
-                "goal_feet_yaw": anim.get("goal_feet_yaw", 0),
-                "eye_yaw": anim.get("eye_yaw", 0),
-                "layer3_weight": anim.get("layer3_weight", 0),
-                "layer3_cycle": anim.get("layer3_cycle", 0),
-                "relative_angle": target.get("relative_angle", 0),
-                "choked_ticks": target.get("choke", 0),
-                "duck_amount": target.get("duck", 0),
-                "miss_streak": config.get("miss_streak", 0),
-            }
-            # We use background tasks or fire-and-forget for database ops to keep latency low
-            threading.Thread(target=lambda: supabase.table("resolver_data").insert(db_payload).execute()).start()
-        except: pass
+        db_payload = {
+            "shot_id": shot_id,
+            "timestamp": datetime.utcnow().isoformat(),
+            "velocity_x": vel.get("x", 0.0),
+            "velocity_y": vel.get("y", 0.0),
+            "goal_feet_yaw": anim.get("goal_feet_yaw", 0.0),
+            "eye_yaw": anim.get("eye_yaw", 0.0),
+            "layer3_weight": anim.get("layer3_weight", 0.0),
+            "layer3_cycle": anim.get("layer3_cycle", 0.0),
+            "relative_angle": target.get("relative_angle", 0.0),
+            "choked_ticks": target.get("choke", 0),
+            "duck_amount": target.get("duck", 0.0),
+            "miss_streak": config.get("miss_streak", 0),
+            
+            # Legacy columns
+            "confidence": prediction.get("confidence", 0.5) * 100.0,
+            "resolver_mode": config.get("mode", "Adaptive"),
+            "bf_phase": config.get("bf_phase", "Phase 1"),
+            "weapon": local_player.get("weapon", "Unknown"),
+            "distance": 0.0
+        }
+        
+        def save_predict_to_db(payload):
+            try:
+                supabase.table("resolver_data").insert(payload).execute()
+            except Exception as e:
+                print(f"❌ Supabase /predict Insert Error: {e}")
+        
+        threading.Thread(target=save_predict_to_db, args=(db_payload,)).start()
 
     return JSONResponse(prediction)
 
@@ -168,32 +180,46 @@ async def analyze(request: Request):
         "override_baim": False
     }
     
-    if data.get("miss_streak", 0) >= 3:
+    config = data.get("config") or {}
+    if config.get("miss_streak", 0) >= 3:
         suggestion["bf_phase"] = "Phase 2 (Aggressive)"
         suggestion["override_baim"] = True
 
     if supabase:
+        local_player = data.get("local_player") or {}
         target = data.get("target") or {}
         config = data.get("config") or {}
         anim = target.get("anim") or {}
         vel = target.get("vel") or {}
         
-        try:
-            db_payload = {
-                "timestamp": datetime.utcnow().isoformat(),
-                "velocity_x": vel.get("x", 0),
-                "velocity_y": vel.get("y", 0),
-                "goal_feet_yaw": anim.get("goal_feet_yaw", 0),
-                "eye_yaw": anim.get("eye_yaw", 0),
-                "layer3_weight": anim.get("layer3_weight", 0),
-                "layer3_cycle": anim.get("layer3_cycle", 0),
-                "relative_angle": target.get("relative_angle", 0),
-                "choked_ticks": target.get("choke", 0),
-                "duck_amount": target.get("duck", 0),
-                "miss_streak": config.get("miss_streak", 0),
-            }
-            threading.Thread(target=lambda: supabase.table("resolver_data").insert(db_payload).execute()).start()
-        except: pass
+        db_payload = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "velocity_x": vel.get("x", 0.0),
+            "velocity_y": vel.get("y", 0.0),
+            "goal_feet_yaw": anim.get("goal_feet_yaw", 0.0),
+            "eye_yaw": anim.get("eye_yaw", 0.0),
+            "layer3_weight": anim.get("layer3_weight", 0.0),
+            "layer3_cycle": anim.get("layer3_cycle", 0.0),
+            "relative_angle": target.get("relative_angle", 0.0),
+            "choked_ticks": target.get("choke", 0),
+            "duck_amount": target.get("duck", 0.0),
+            "miss_streak": config.get("miss_streak", 0),
+            
+            # Legacy columns
+            "confidence": 100.0,
+            "resolver_mode": config.get("mode", "Adaptive"),
+            "bf_phase": config.get("bf_phase", "Phase 1"),
+            "weapon": local_player.get("weapon", "Unknown"),
+            "distance": 0.0
+        }
+        
+        def save_to_db(payload):
+            try:
+                supabase.table("resolver_data").insert(payload).execute()
+            except Exception as e:
+                print(f"❌ Supabase /analyze Insert Error: {e}")
+        
+        threading.Thread(target=save_to_db, args=(db_payload,)).start()
 
     return JSONResponse(suggestion)
 
