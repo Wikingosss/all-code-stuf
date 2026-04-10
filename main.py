@@ -78,7 +78,7 @@ def is_valid_telemetry(data: list) -> bool:
     """Check if the provided features contain 'garbage' values (massive numbers)."""
     # goal_feet_yaw (4), eye_yaw (5), relative_angle (8)
     try:
-        if abs(data[4]) > 720 or abs(data[5]) > 720 or abs(data[8]) > 720:
+        if abs(data[4]) > 1000000 or abs(data[5]) > 1000000 or abs(data[8]) > 1000000:
             return False
     except: return False
     return True
@@ -188,22 +188,34 @@ async def analyze(request: Request):
     print(f"📥 Received Analyze: {data}")
     global_patterns += 1
 
+    features = extract_features(data)
     suggestion = {
+        "prediction_angle": 58 if (data.get("target", {}).get("anim", {}).get("desync_delta", 0) > 0) else -58,
         "bf_phase": "Phase 1 (Adaptive)",
-        "override_baim": False
+        "resolver_mode": "Neural AI",
+        "override_baim": data.get("config", {}).get("miss_streak", 0) >= 2
     }
     
-    config = data.get("config") or {}
-    if config.get("miss_streak", 0) >= 3:
-        suggestion["bf_phase"] = "Phase 2 (Aggressive)"
-        suggestion["override_baim"] = True
+    # ML Override if model is available
+    if AI_MODEL:
+        try:
+            X = np.array([features])
+            pred_side_idx = AI_MODEL.predict(X)[0]
+            pred_proba = AI_MODEL.predict_proba(X)[0]
+            conf = float(np.max(pred_proba))
+            
+            suggestion["prediction_angle"] = 58 if pred_side_idx == 1 else -58
+            suggestion["confidence"] = conf
+            
+            if conf > 0.8:
+                suggestion["bf_phase"] = "Phase 2 (Aggressive)"
+        except: pass
 
     if supabase:
         local_player = data.get("local_player") or {}
         target = data.get("target") or {}
         config = data.get("config") or {}
         anim = target.get("anim") or {}
-        vel = target.get("vel") or {}
         lp_vel = local_player.get("vel") or {}
         
         db_payload = {
@@ -215,9 +227,9 @@ async def analyze(request: Request):
             "layer3_cycle": anim.get("layer3_cycle", 0.0),
             "relative_angle": target.get("relative_angle", 0.0),
             "miss_streak": config.get("miss_streak", 0),
-            "confidence": 100.0,
-            "resolver_mode": config.get("mode", "Adaptive"),
-            "bf_phase": config.get("bf_phase", "Phase 1")
+            "confidence": suggestion.get("confidence", 0.5) * 100.0,
+            "resolver_mode": suggestion["resolver_mode"],
+            "bf_phase": suggestion["bf_phase"]
         }
         
         try:
