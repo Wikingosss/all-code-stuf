@@ -125,7 +125,6 @@ async def predict(request: Request):
         
         db_payload = {
             "shot_id": shot_id,
-            "timestamp": datetime.utcnow().isoformat(),
             "local_velocity_x": lp_vel.get("x", 0.0),
             "local_velocity_y": lp_vel.get("y", 0.0),
             "goal_feet_yaw": anim.get("goal_feet_yaw", 0.0),
@@ -133,22 +132,19 @@ async def predict(request: Request):
             "layer3_weight": anim.get("layer3_weight", 0.0),
             "layer3_cycle": anim.get("layer3_cycle", 0.0),
             "relative_angle": target.get("relative_angle", 0.0),
-            "choked_ticks": target.get("choke", 0),
-            "duck_amount": target.get("duck", 0.0),
             "miss_streak": config.get("miss_streak", 0),
-            "weapon": local_player.get("weapon", "Unknown"),
-            "distance": config.get("distance", 0.0)
+            "confidence": prediction.get("confidence", 0.5) * 100.0,
+            "resolver_mode": config.get("mode", "Adaptive"),
+            "bf_phase": config.get("bf_phase", "Phase 1")
         }
         
-        def save_predict_to_db(payload):
-            try:
-                # Use synchronous insert for debugging or ensure it's caught
-                result = supabase.table("resolver_data").insert(payload).execute()
-                print(f"✅ DB Insert Success for shot {shot_id}")
-            except Exception as e:
-                print(f"❌ SUPABASE ERROR (Shot {shot_id}): {e}")
-        
-        threading.Thread(target=save_predict_to_db, args=(db_payload,)).start()
+        try:
+            # Synchronous insert for direct error feedback to Lua console
+            supabase.table("resolver_data").insert(db_payload).execute()
+        except Exception as e:
+            print(f"🔥 Supabase Insert Error: {e}")
+            # Raising error here will return 500 to Lua, showing the error in game console
+            raise e
 
     return JSONResponse(prediction)
 
@@ -201,7 +197,6 @@ async def analyze(request: Request):
         lp_vel = local_player.get("vel") or {}
         
         db_payload = {
-            "timestamp": datetime.utcnow().isoformat(),
             "local_velocity_x": lp_vel.get("x", 0.0),
             "local_velocity_y": lp_vel.get("y", 0.0),
             "goal_feet_yaw": anim.get("goal_feet_yaw", 0.0),
@@ -209,21 +204,17 @@ async def analyze(request: Request):
             "layer3_weight": anim.get("layer3_weight", 0.0),
             "layer3_cycle": anim.get("layer3_cycle", 0.0),
             "relative_angle": target.get("relative_angle", 0.0),
-            "choked_ticks": target.get("choke", 0),
-            "duck_amount": target.get("duck", 0.0),
             "miss_streak": config.get("miss_streak", 0),
-            "weapon": local_player.get("weapon", "Unknown"),
-            "distance": config.get("distance", 0.0)
+            "confidence": 100.0,
+            "resolver_mode": config.get("mode", "Adaptive"),
+            "bf_phase": config.get("bf_phase", "Phase 1")
         }
         
-        def save_to_db(payload):
-            try:
-                supabase.table("resolver_data").insert(payload).execute()
-                print("✅ DB Periodic Sync Success")
-            except Exception as e:
-                print(f"❌ SUPABASE ERROR (Sync): {e}")
-        
-        threading.Thread(target=save_to_db, args=(db_payload,)).start()
+        try:
+            supabase.table("resolver_data").insert(db_payload).execute()
+        except Exception as e:
+            print(f"🔥 Supabase Sync Error: {e}")
+            raise e
 
     return JSONResponse(suggestion)
 
