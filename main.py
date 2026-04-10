@@ -76,9 +76,9 @@ def extract_features(data: dict) -> list:
 
 def is_valid_telemetry(data: list) -> bool:
     """Check if the provided features contain 'garbage' values (massive numbers)."""
-    # goal_feet_yaw (4), eye_yaw (5), relative_angle (8)
+    # Simply block absolute pointers (huge scientific notation)
     try:
-        if abs(data[4]) > 1000000 or abs(data[5]) > 1000000 or abs(data[8]) > 1000000:
+        if abs(data[4]) > 100000000 or abs(data[5]) > 100000000:
             return False
     except: return False
     return True
@@ -186,14 +186,11 @@ async def analyze(request: Request):
     global global_patterns
     data = await request.json()
     print(f"📥 Received Analyze: {data}")
-    global_patterns += 1
-
     features = extract_features(data)
     suggestion = {
         "prediction_angle": 58 if (data.get("target", {}).get("anim", {}).get("desync_delta", 0) > 0) else -58,
         "bf_phase": "Phase 1 (Adaptive)",
-        "resolver_mode": "Neural AI",
-        "override_baim": data.get("config", {}).get("miss_streak", 0) >= 2
+        "resolver_mode": "Neural AI"
     }
     
     # ML Override if model is available
@@ -233,7 +230,6 @@ async def analyze(request: Request):
         }
         
         try:
-            features = extract_features(data)
             if is_valid_telemetry(features):
                 supabase.table("resolver_data").insert(db_payload).execute()
         except Exception as e:
