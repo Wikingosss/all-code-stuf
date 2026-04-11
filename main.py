@@ -83,13 +83,28 @@ def is_valid_telemetry(data: list) -> bool:
     except: return False
     return True
 
+def insert_resolver_data_bg(db_payload: dict):
+    if supabase:
+        try:
+            supabase.table("resolver_data").insert(db_payload).execute()
+        except Exception as e:
+            print(f"🔥 Supabase Insert Error bg: {e}")
+
+def update_resolver_data_bg(shot_id: str, update_data: dict, result_str: str):
+    if supabase:
+        try:
+            supabase.table("resolver_data").update(update_data).eq("shot_id", shot_id).execute()
+            print(f"✅ Outcome recorded (bg): shot_id={shot_id} | {result_str}")
+        except Exception as e:
+            print(f"❌ Outcome Error bg: {e}")
+
 # ===== API Endpoints =====
 
 @app.post("/predict")
-async def predict(request: Request):
+async def predict(request: Request, background_tasks: BackgroundTasks):
     """Real-time prediction for Lua's aim_fire event."""
     data = await request.json()
-    print(f"📥 Received Predict: {data}")
+    # print(f"📥 Received Predict: {data}") # Disabled to reduce log spam
     shot_id = data.get("shot_id")
     
     # Extract features for prediction
@@ -149,17 +164,16 @@ async def predict(request: Request):
         try:
             # ONLY save to DB if telemetry is sane
             if is_valid_telemetry(features):
-                supabase.table("resolver_data").insert(db_payload).execute()
+                background_tasks.add_task(insert_resolver_data_bg, db_payload)
             else:
                 print(f"⚠️ Ignored garbage telemetry for shot {shot_id}")
         except Exception as e:
-            print(f"🔥 Supabase Insert Error: {e}")
-            raise e
+            print(f"🔥 Task creation Error: {e}")
 
     return JSONResponse(prediction)
 
 @app.post("/outcome")
-async def outcome(request: Request):
+async def outcome(request: Request, background_tasks: BackgroundTasks):
     """Receive feedback from Lua on whether a shot hit or missed."""
     data = await request.json()
     shot_id  = data.get("shot_id")
@@ -170,24 +184,20 @@ async def outcome(request: Request):
     if not shot_id or not supabase:
         return JSONResponse(status_code=200, content={"status": "ignored", "reason": "no shot_id or no db"})
 
-    try:
-        update_data = {
-            "hit": hit,
-            "damage_dealt": damage,
-            "miss_reason": reason
-        }
-        supabase.table("resolver_data").update(update_data).eq("shot_id", shot_id).execute()
-        result_str = f"{'HIT' if hit else 'MISS'} | dmg={damage} | reason={reason}"
-        print(f"✅ Outcome recorded: shot_id={shot_id} | {result_str}")
-        return JSONResponse(status_code=200, content={"status": "success", "recorded": result_str})
-    except Exception as e:
-        print(f"❌ Outcome Error: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+    update_data = {
+        "hit": hit,
+        "damage_dealt": damage,
+        "miss_reason": reason
+    }
+    result_str = f"{'HIT' if hit else 'MISS'} | dmg={damage} | reason={reason}"
+    
+    background_tasks.add_task(update_resolver_data_bg, shot_id, update_data, result_str)
+    return JSONResponse(status_code=200, content={"status": "success", "recorded": result_str})
 
 global_patterns = 0
 
 @app.post("/analyze")
-async def analyze(request: Request):
+async def analyze(request: Request, background_tasks: BackgroundTasks):
     """General telemetry harvesting (Legacy & Flat support)."""
     global global_patterns
     data = await request.json()
@@ -237,10 +247,9 @@ async def analyze(request: Request):
         
         try:
             if is_valid_telemetry(features):
-                supabase.table("resolver_data").insert(db_payload).execute()
+                background_tasks.add_task(insert_resolver_data_bg, db_payload)
         except Exception as e:
-            print(f"🔥 Supabase Sync Error: {e}")
-            raise e
+            print(f"🔥 Task creation Error: {e}")
 
     return JSONResponse(suggestion)
 
