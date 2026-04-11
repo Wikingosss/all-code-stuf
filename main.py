@@ -162,21 +162,27 @@ async def predict(request: Request):
 async def outcome(request: Request):
     """Receive feedback from Lua on whether a shot hit or missed."""
     data = await request.json()
-    shot_id = data.get("shot_id")
+    shot_id  = data.get("shot_id")
+    hit      = data.get("hit", False)
+    damage   = data.get("damage", 0)
+    reason   = data.get("reason", "none")
+
     if not shot_id or not supabase:
-        return {"status": "ignored"}
+        return JSONResponse(status_code=200, content={"status": "ignored", "reason": "no shot_id or no db"})
 
     try:
         update_data = {
-            "hit": data.get("hit", False),
-            "damage_dealt": data.get("damage", 0),
-            "miss_reason": data.get("reason", "none")
+            "hit": hit,
+            "damage_dealt": damage,
+            "miss_reason": reason
         }
-        # Update the existing shot record with the result
         supabase.table("resolver_data").update(update_data).eq("shot_id", shot_id).execute()
-        return {"status": "success"}
+        result_str = f"{'HIT' if hit else 'MISS'} | dmg={damage} | reason={reason}"
+        print(f"✅ Outcome recorded: shot_id={shot_id} | {result_str}")
+        return JSONResponse(status_code=200, content={"status": "success", "recorded": result_str})
     except Exception as e:
-        return {"status": "error", "message": str(e)}
+        print(f"❌ Outcome Error: {e}")
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
 
 global_patterns = 0
 
@@ -242,11 +248,36 @@ async def analyze(request: Request):
 async def trigger_training(background_tasks: BackgroundTasks):
     global TRAINING_IN_PROGRESS
     if TRAINING_IN_PROGRESS:
-        return {"status": "busy", "message": "Training already in progress"}
-    
+        return JSONResponse(status_code=200, content={
+            "status": "busy",
+            "message": "Training already in progress"
+        })
+
+    # Gather sample counts before starting so Lua can display them
+    total_samples   = 0
+    labeled_samples = 0
+    if supabase:
+        try:
+            res_all = supabase.table("resolver_data").select("id", count="exact").limit(1).execute()
+            total_samples = res_all.count or 0
+        except:
+            pass
+        try:
+            res_labeled = supabase.table("resolver_data").select("id", count="exact").not_.is_("hit", "null").limit(1).execute()
+            labeled_samples = res_labeled.count or 0
+        except:
+            pass
+
     TRAINING_IN_PROGRESS = True
     background_tasks.add_task(train_model_bg)
-    return {"status": "started", "message": "ML training started in background using actual hit/miss data."}
+    print(f"🧠 Training triggered | total={total_samples} | labeled={labeled_samples} | prior_model={AI_MODEL is not None}")
+    return JSONResponse(status_code=200, content={
+        "status":          "started",
+        "message":         "ML training started in background using hit/miss labeled data.",
+        "total_samples":   total_samples,
+        "labeled_samples": labeled_samples,
+        "model_loaded":    AI_MODEL is not None
+    })
 
 def train_model_bg():
     global AI_MODEL, TRAINING_IN_PROGRESS
