@@ -1,4 +1,5 @@
 import os
+import uuid
 import threading
 import numpy as np
 import pandas as pd
@@ -150,15 +151,21 @@ async def predict(request: Request, background_tasks: BackgroundTasks):
             "shot_id": shot_id,
             "local_velocity_x": lp_vel.get("x", 0.0),
             "local_velocity_y": lp_vel.get("y", 0.0),
+            "velocity_x": vel.get("x", 0.0),
+            "velocity_y": vel.get("y", 0.0),
             "goal_feet_yaw": anim.get("goal_feet_yaw", 0.0),
             "eye_yaw": anim.get("eye_yaw", 0.0),
             "layer3_weight": anim.get("layer3_weight", 0.0),
             "layer3_cycle": anim.get("layer3_cycle", 0.0),
             "relative_angle": target.get("relative_angle", 0.0),
+            "choked_ticks": target.get("choke", 0),
+            "duck_amount": target.get("duck", 0.0),
             "miss_streak": config.get("miss_streak", 0),
             "confidence": prediction.get("confidence", 0.5) * 100.0,
             "resolver_mode": config.get("mode", "Adaptive"),
-            "bf_phase": config.get("bf_phase", "Phase 1")
+            "bf_phase": config.get("bf_phase", "Phase 1"),
+            "weapon": config.get("weapon", "Global"),
+            "distance": config.get("distance", 0.0)
         }
         
         try:
@@ -231,18 +238,26 @@ async def analyze(request: Request, background_tasks: BackgroundTasks):
         anim = target.get("anim") or {}
         lp_vel = local_player.get("vel") or {}
         
+        vel = target.get("vel") or {}
         db_payload = {
+            "shot_id": str(uuid.uuid4()),
             "local_velocity_x": lp_vel.get("x", 0.0),
             "local_velocity_y": lp_vel.get("y", 0.0),
+            "velocity_x": vel.get("x", 0.0),
+            "velocity_y": vel.get("y", 0.0),
             "goal_feet_yaw": anim.get("goal_feet_yaw", 0.0),
             "eye_yaw": anim.get("eye_yaw", 0.0),
             "layer3_weight": anim.get("layer3_weight", 0.0),
             "layer3_cycle": anim.get("layer3_cycle", 0.0),
             "relative_angle": target.get("relative_angle", 0.0),
+            "choked_ticks": target.get("choke", 0),
+            "duck_amount": target.get("duck", 0.0),
             "miss_streak": config.get("miss_streak", 0),
             "confidence": suggestion.get("confidence", 0.5) * 100.0,
             "resolver_mode": suggestion["resolver_mode"],
-            "bf_phase": suggestion["bf_phase"]
+            "bf_phase": suggestion["bf_phase"],
+            "weapon": config.get("weapon", "Global"),
+            "distance": config.get("distance", 0.0)
         }
         
         try:
