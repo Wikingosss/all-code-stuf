@@ -20,8 +20,8 @@ app = FastAPI(title="$hematic AI Backend", version="3.0.0")
 # ============================================================
 # DATABASE
 # ============================================================
-SUPABASE_URL = os.environ.get("SUPABASE_URL", "")
-SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "")
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://qpymjauuxmkhgtrfetts.supabase.co")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_THmDuhsaJ0xRUqxgySek8g_aCGKmWQi")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
