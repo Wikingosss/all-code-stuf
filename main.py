@@ -157,8 +157,9 @@ def features_to_vector(feat: dict) -> list:
     return [feat[k] for k in FEATURES]
 
 def is_valid_features(feat: dict) -> tuple[bool, str]:
+    # CS:GO yaw angles are NOT normalized before sending — use wide limit to catch only FFI garbage
     checks = {
-        "goal_feet_yaw": 360.0, "eye_yaw": 360.0, "body_yaw": 360.0,
+        "goal_feet_yaw": 1800.0, "eye_yaw": 1800.0, "body_yaw": 1800.0,
         "velocity_x": 10_000.0, "velocity_y": 10_000.0,
     }
     for name, limit in checks.items():
@@ -367,7 +368,8 @@ def train_model_bg():
             return
 
         df["label"]    = df["hit"].astype(int)
-        sample_weights = df["hit"].astype(int).apply(lambda h: 3.0 if h else 1.0)
+        # Balance: misses matter equally for resolver training
+        sample_weights = df["hit"].astype(int).apply(lambda h: 1.5 if h else 1.0)
         X = df[available].values.astype(np.float32)
         y = df["label"].values
 
@@ -605,12 +607,15 @@ async def stats():
             labeled_db = r.count or labeled_db
         except: pass
 
+    # Real accuracy from model CV if available, else from memory store, else 0 (not fake 87)
+    real_conf = accuracy if labeled_db > 0 else 0
+
     return JSONResponse({
         "users_online":      1,
         "patterns_saved":    total_db,
         "resolver_records":  labeled_db,
         "ai_iterations":     labeled_db,
-        "avg_confidence":    accuracy if accuracy > 0 else 87,
+        "avg_confidence":    real_conf,
         "ai_status":         "Neural" if AI_MODEL else "Heuristic",
         "pending_shots":     len(pending_shots),
         "shot_id_map_size":  len(shot_id_map),
