@@ -283,6 +283,19 @@ def _predict(data: dict, steam_id: str = "") -> tuple[dict, dict]:
 # ============================================================
 def _db_insert(payload: dict):
     safe = _strip(payload)
+    # Sanitize: ensure all float columns are actually float (not None)
+    float_cols = {
+        "velocity_x","velocity_y","speed_2d","distance","local_velocity_x","local_velocity_y",
+        "goal_feet_yaw","eye_yaw","body_yaw","desync_delta","layer3_weight","layer3_cycle",
+        "relative_angle","duck_amount","local_duck","local_shots_fired","confidence",
+    }
+    int_cols = {"miss_streak","choked_ticks","health","armor","damage_dealt","hitgroup"}
+    for col in float_cols:
+        if col in safe and safe[col] is None:
+            safe[col] = 0.0
+    for col in int_cols:
+        if col in safe and safe[col] is None:
+            safe[col] = 0
     if supabase:
         try:
             supabase.table("resolver_data").insert(safe).execute()
@@ -459,8 +472,9 @@ async def _startup():
     _load_model()
     if supabase:
         try:
-            supabase.table("resolver_data").select("shot_id").limit(1).execute()
-            print("✅ DB probe OK")
+            r = supabase.table("resolver_data").select("id", count="exact").limit(1).execute()
+            total = r.count or 0
+            print(f"✅ DB probe OK | total rows: {total}")
         except Exception as e:
             print(f"⚠️  DB probe: {e}")
 
@@ -572,8 +586,15 @@ async def analyze_ep(request: Request, bg: BackgroundTasks):
         bg.add_task(_db_insert, _build_payload(shot_id, feat, pred, data))
 
     conf = pred["confidence"]
+    # bf_phase strings MUST match Lua combobox options exactly
+    if conf > 0.78:
+        bf = "[3] Phase 3 (Custom)"
+    elif conf > 0.62:
+        bf = "[2] Phase 2 (Aggressive)"
+    else:
+        bf = "[1] Phase 1 (Adaptive)"
     return JSONResponse({
-        "bf_phase":       "Phase 2 (Aggressive)" if conf > 0.72 else "Phase 1 (Adaptive)",
+        "bf_phase":       bf,
         "resolver_mode":  "Neural AI" if pred["source"] == "gbm" else "Adaptive",
         "override_baim":  pred["force_baim"],
         "confidence":     conf,
@@ -625,6 +646,7 @@ async def stats_ep():
 
     real_conf = round(last_cv_accuracy * 100, 1) if AI_MODEL and last_cv_accuracy > 0 \
                 else mem_acc
+    hit_rate  = round((hits / labeled * 100) if labeled > 0 else 0.0, 1)
 
     return JSONResponse({
         "users_online":      1,
@@ -632,6 +654,7 @@ async def stats_ep():
         "resolver_records":  labeled,
         "ai_iterations":     labeled,
         "avg_confidence":    real_conf,
+        "hit_rate":          hit_rate,
         "ai_status":         "GBM" if AI_MODEL else "Heuristic",
         "last_sync":         datetime.now(timezone.utc).isoformat(),
         "your_contribution": "Active" if memory_store else "Inactive",
