@@ -281,21 +281,35 @@ def _predict(data: dict, steam_id: str = "") -> tuple[dict, dict]:
 # ============================================================
 # DATABASE
 # ============================================================
+# Columns that must be INTEGER in Postgres (PostgREST rejects 0.0 for INTEGER)
+_INT_COLS   = {"miss_streak", "choked_ticks", "health", "armor",
+               "damage_dealt", "hitgroup", "local_shots_fired"}
+_FLOAT_COLS = {
+    "velocity_x","velocity_y","speed_2d","distance",
+    "local_velocity_x","local_velocity_y",
+    "goal_feet_yaw","eye_yaw","body_yaw","desync_delta",
+    "layer3_weight","layer3_cycle","relative_angle",
+    "duck_amount","local_duck","confidence",
+}
+
+def _coerce_types(d: dict) -> dict:
+    """Ensure int columns get int values and float columns get float values."""
+    for col in _INT_COLS:
+        if col in d:
+            try:
+                d[col] = int(float(d[col])) if d[col] is not None else 0
+            except (TypeError, ValueError):
+                d[col] = 0
+    for col in _FLOAT_COLS:
+        if col in d:
+            try:
+                d[col] = float(d[col]) if d[col] is not None else 0.0
+            except (TypeError, ValueError):
+                d[col] = 0.0
+    return d
+
 def _db_insert(payload: dict):
-    safe = _strip(payload)
-    # Sanitize: ensure all float columns are actually float (not None)
-    float_cols = {
-        "velocity_x","velocity_y","speed_2d","distance","local_velocity_x","local_velocity_y",
-        "goal_feet_yaw","eye_yaw","body_yaw","desync_delta","layer3_weight","layer3_cycle",
-        "relative_angle","duck_amount","local_duck","local_shots_fired","confidence",
-    }
-    int_cols = {"miss_streak","choked_ticks","health","armor","damage_dealt","hitgroup"}
-    for col in float_cols:
-        if col in safe and safe[col] is None:
-            safe[col] = 0.0
-    for col in int_cols:
-        if col in safe and safe[col] is None:
-            safe[col] = 0
+    safe = _coerce_types(_strip(payload))
     if supabase:
         try:
             supabase.table("resolver_data").insert(safe).execute()
@@ -307,8 +321,8 @@ def _db_insert(payload: dict):
 
 def _db_outcome(shot_id: str, hit: bool, damage: int, reason: str,
                 hitgroup: int, fallback: dict | None):
-    upd = {"hit": hit, "damage_dealt": damage,
-           "miss_reason": str(reason), "hitgroup": hitgroup}
+    upd = {"hit": hit, "damage_dealt": int(damage),
+           "miss_reason": str(reason), "hitgroup": int(hitgroup)}
     if supabase:
         try:
             res  = supabase.table("resolver_data").update(upd).eq("shot_id", shot_id).execute()
@@ -329,9 +343,11 @@ def _db_outcome(shot_id: str, hit: bool, damage: int, reason: str,
 
 def _fallback_rec(shot_id: str, hit: bool, damage: int, reason: str) -> dict:
     now = datetime.now(timezone.utc).isoformat()
-    return {"shot_id": shot_id, "hit": hit, "damage_dealt": damage,
-            "miss_reason": str(reason), "created_at": now,
-            **{k: 0.0 for k in FEATURES}}
+    base = {"shot_id": shot_id, "hit": hit, "damage_dealt": int(damage),
+            "miss_reason": str(reason), "created_at": now}
+    for k in FEATURES:
+        base[k] = 0 if k in _INT_COLS else 0.0
+    return base
 
 def _build_payload(shot_id: str, feat: dict, pred: dict, data: dict) -> dict:
     cfg = data.get("config") or {}
