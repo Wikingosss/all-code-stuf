@@ -84,10 +84,13 @@ def _strip(payload: dict) -> dict:
 memory_store: list[dict] = []
 MAX_MEMORY = 8000
 
-pending_shots: dict[str, dict] = {}   # uuid → {ts, payload}
+pending_shots: dict[str, dict] = {}    # uuid → {ts, payload}
 PENDING_TTL = 120
 
-shot_id_map: dict[str, str] = {}      # lua int str → uuid str
+shot_id_map: dict[str, str] = {}       # lua int str → uuid str
+
+# Outcomes that arrived before /predict inserted the row
+pending_outcomes: dict[str, dict] = {} # lua_id → {upd, ts}
 
 # Per-steam_id hit/miss side history — core of heuristic
 player_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=32))
@@ -320,26 +323,32 @@ def _db_insert(payload: dict):
     memory_store.append(safe)
 
 def _db_outcome(shot_id: str, hit: bool, damage: int, reason: str,
-                hitgroup: int, fallback: dict | None):
+                hitgroup: int, fallback: dict | None, lua_id: str | None = None):
     upd = {"hit": hit, "damage_dealt": int(damage),
            "miss_reason": str(reason), "hitgroup": int(hitgroup)}
     if supabase:
         try:
             res  = supabase.table("resolver_data").update(upd).eq("shot_id", shot_id).execute()
             rows = len(res.data) if res.data else 0
+            # Retry with lua integer string (race: outcome before predict)
+            if rows == 0 and lua_id and lua_id != shot_id:
+                res2 = supabase.table("resolver_data").update(upd).eq("shot_id", lua_id).execute()
+                rows = len(res2.data) if res2.data else 0
             print(f"{'✅ HIT' if hit else '❌ MISS'} | shot={shot_id[:8]} | dmg={damage} | rows={rows}")
             if rows == 0:
-                rec = dict(fallback) if fallback else _fallback_rec(shot_id, hit, damage, reason)
-                rec.update(upd)
-                supabase.table("resolver_data").insert(_strip(rec)).execute()
-                print(f"↩️  Fallback insert | shot={shot_id[:8]}")
+                # Park outcome — /predict hasn't inserted the row yet
+                # Will be applied when /predict arrives (see predict_ep)
+                key = lua_id or shot_id
+                pending_outcomes[key] = {"upd": upd, "ts": time.time()}
+                print(f"⏳ Queued outcome | lua={key} (predict not yet arrived)")
         except Exception as e:
             print(f"🔥 DB outcome: {e}")
     for rec in memory_store:
-        if rec.get("shot_id") == shot_id:
+        if rec.get("shot_id") in (shot_id, lua_id):
             rec.update(upd)
             break
     pending_shots.pop(shot_id, None)
+    if lua_id: pending_shots.pop(lua_id, None)
 
 def _fallback_rec(shot_id: str, hit: bool, damage: int, reason: str) -> dict:
     now = datetime.now(timezone.utc).isoformat()
@@ -398,6 +407,10 @@ def _cleanup_pending():
             if uv == sid:
                 shot_id_map.pop(lk, None)
                 break
+    # Clean stale pending outcomes (older than 30s — predict never arrived)
+    stale_out = [k for k, v in pending_outcomes.items() if now - v["ts"] > 30]
+    for k in stale_out:
+        pending_outcomes.pop(k, None)
 
 # ============================================================
 # TRAINING
@@ -541,7 +554,17 @@ async def predict_ep(request: Request, bg: BackgroundTasks):
     payload    = _build_payload(shot_id, feat, pred, data)
 
     pending_shots[shot_id] = {"ts": time.time(), "payload": payload}
-    bg.add_task(_db_insert, payload)
+    # Insert synchronously so row exists before we check pending_outcomes below
+    _db_insert(payload)
+
+    # Apply any queued outcome (arrived before this predict)
+    queued = pending_outcomes.pop(lua_id, None) or pending_outcomes.pop(shot_id, None)
+    if queued and supabase:
+        try:
+            r2 = supabase.table("resolver_data").update(queued["upd"]).eq("shot_id", shot_id).execute()
+            print(f"✅ Applied queued outcome | shot={shot_id[:8]} | rows={len(r2.data) if r2.data else 0}")
+        except Exception as e:
+            print(f"🔥 Queued outcome apply: {e}")
 
     player_history[steam_id].append({
         "side": pred["predicted_side"], "hit": None, "shot_id": shot_id,
@@ -562,11 +585,17 @@ async def outcome_ep(request: Request, bg: BackgroundTasks):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "bad json"})
 
-    raw_id   = str(data.get("shot_id") or "")
-    if not raw_id:
+    raw_id  = str(data.get("shot_id") or "")
+    lua_id  = str(data.get("lua_id")  or raw_id)  # original Lua integer string
+    if not raw_id and not lua_id:
         return JSONResponse({"status": "ignored"})
 
-    shot_id  = shot_id_map.get(raw_id, raw_id)
+    # Resolve UUID: try shot_id_map with both raw_id and lua_id
+    shot_id = (shot_id_map.get(raw_id)
+               or shot_id_map.get(lua_id)
+               or pending_shots.get(lua_id, {}).get("uuid")
+               or raw_id)
+
     hit      = bool(data.get("hit", False))
     damage   = int(data.get("damage") or 0)
     reason   = data.get("reason") or "none"
@@ -574,14 +603,16 @@ async def outcome_ep(request: Request, bg: BackgroundTasks):
 
     for steam_id, hist in player_history.items():
         for entry in hist:
-            if entry.get("shot_id") == shot_id:
+            if entry.get("shot_id") in (shot_id, lua_id):
                 entry["hit"] = hit
                 break
 
-    pending  = pending_shots.get(shot_id)
+    # Try to find pending payload by UUID or lua integer
+    pending  = pending_shots.get(shot_id) or pending_shots.get(lua_id)
     fallback = pending["payload"] if pending else None
 
-    bg.add_task(_db_outcome, shot_id, hit, damage, reason, hitgroup, fallback)
+    # Pass lua_id so _db_outcome can retry with integer if UUID row not found
+    bg.add_task(_db_outcome, shot_id, hit, damage, reason, hitgroup, fallback, lua_id)
     return JSONResponse({"status": "ok", "hit": hit, "shot_id": shot_id})
 
 
