@@ -43,6 +43,14 @@ AUTO_TRAIN_ENABLED = os.environ.get("AUTO_TRAIN_ENABLED", "1") == "1"
 AUTO_TRAIN_EVERY = max(10, int(os.environ.get("AUTO_TRAIN_EVERY", "120")))
 AUTO_TRAIN_MIN_LABELED = max(30, int(os.environ.get("AUTO_TRAIN_MIN_LABELED", "120")))
 AUTO_TRAIN_COOLDOWN_SEC = max(60, int(os.environ.get("AUTO_TRAIN_COOLDOWN_SEC", "300")))
+PERIODIC_TRAIN_ENABLED = os.environ.get("PERIODIC_TRAIN_ENABLED", "1") == "1"
+PERIODIC_TRAIN_INTERVAL_SEC = max(300, int(os.environ.get("PERIODIC_TRAIN_INTERVAL_SEC", "1800")))
+TRAIN_MIN_LABELED = max(20, int(os.environ.get("TRAIN_MIN_LABELED", "50")))
+TRAIN_MAX_ROWS = max(2000, int(os.environ.get("TRAIN_MAX_ROWS", "20000")))
+TRAIN_HARD_MISS_ROWS = max(200, int(os.environ.get("TRAIN_HARD_MISS_ROWS", "2500")))
+TRAIN_HARD_MISS_BOOST = max(1.0, float(os.environ.get("TRAIN_HARD_MISS_BOOST", "1.6")))
+ANALYZE_DB_WRITE = os.environ.get("ANALYZE_DB_WRITE", "0") == "1"
+ANALYZE_DB_EVERY_N = max(1, int(os.environ.get("ANALYZE_DB_EVERY_N", "20")))
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -120,6 +128,11 @@ prediction_metrics = {
     "ml_used": 0,
     "heuristic_used": 0,
     "invalid_telemetry": 0,
+}
+analyze_counter = 0
+
+HARD_MISS_REASONS = {
+    "resolver", "?", "unknown", "prediction error", "prediction_error", "occlusion"
 }
 
 def _resolve_sid(lua_id: str) -> str:
@@ -502,6 +515,12 @@ def _save_model_artifacts(cv_mean: float, n_samples: int, trigger: str, features
     except Exception as e:
         print(f"⚠️ snapshot save: {e}")
 
+    _activate_profile_from_cv(cv_mean, snapshot_id)
+
+
+def _activate_profile_from_cv(cv_mean: float, snapshot_id: int | None = None):
+    if not supabase:
+        return
     try:
         settings = {
             "resolver_mode": "Neural AI" if cv_mean >= 0.58 else "Adaptive",
@@ -518,6 +537,49 @@ def _save_model_artifacts(cv_mean: float, n_samples: int, trigger: str, features
         supabase.table("resolver_profiles").insert(p).execute()
     except Exception as e:
         print(f"⚠️ profile save: {e}")
+
+
+def _save_fallback_profile(reason: str, labeled_rows: int, hits: int, misses: int):
+    if not supabase:
+        return
+    try:
+        settings = {
+            "resolver_mode": "Adaptive",
+            "bf_phase": "[1] Phase 1 (Adaptive)",
+            "min_confidence": 50.0,
+            "fallback_reason": reason,
+            "labeled_rows": int(labeled_rows),
+            "hits": int(hits),
+            "misses": int(misses),
+        }
+        supabase.table("resolver_profiles").update({"is_active": False}).eq("is_active", True).execute()
+        supabase.table("resolver_profiles").insert({
+            "source_model_snapshot_id": None,
+            "settings_json": settings,
+            "is_active": True,
+            "effective_from": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+    except Exception as e:
+        print(f"⚠️ fallback profile save: {e}")
+
+
+def _periodic_training_loop():
+    while True:
+        try:
+            time.sleep(PERIODIC_TRAIN_INTERVAL_SEC)
+            if not PERIODIC_TRAIN_ENABLED:
+                continue
+            if TRAINING_IN_PROGRESS:
+                continue
+            labeled_now = _count_labeled_records()
+            now = time.time()
+            if labeled_now < TRAIN_MIN_LABELED:
+                continue
+            if now - last_train_at_ts < AUTO_TRAIN_COOLDOWN_SEC:
+                continue
+            _start_training("periodic_timer")
+        except Exception as e:
+            print(f"⚠️ periodic trainer: {e}")
 
 
 def _start_training(trigger: str) -> bool:
@@ -550,14 +612,22 @@ def _train_bg(trigger: str = "manual"):
         if supabase:
             try:
                 res = supabase.table("resolver_data").select("*") \
-                              .not_.is_("hit", "null").execute()
+                              .not_.is_("hit", "null").order("created_at", desc=True).limit(TRAIN_MAX_ROWS).execute()
                 records = res.data or []
+
+                res_hard = supabase.table("resolver_data").select("*") \
+                               .eq("hit", False).in_("miss_reason", list(HARD_MISS_REASONS)) \
+                               .order("created_at", desc=True).limit(TRAIN_HARD_MISS_ROWS).execute()
+                hard_rows = res_hard.data or []
+                if hard_rows:
+                    records += hard_rows
             except Exception as e:
                 print(f"⚠️  DB fetch: {e}")
         records += [r for r in memory_store if r.get("hit") is not None]
 
-        if len(records) < 50:
-            print(f"❌ Need ≥50 labeled rows, have {len(records)}")
+        if len(records) < TRAIN_MIN_LABELED:
+            print(f"❌ Need ≥{TRAIN_MIN_LABELED} labeled rows, have {len(records)}")
+            training_status["last_error"] = f"Need >={TRAIN_MIN_LABELED} labeled rows, have {len(records)}"
             return
 
         df  = pd.DataFrame(records)
@@ -569,16 +639,30 @@ def _train_bg(trigger: str = "manual"):
         df  = df.dropna(subset=avail + ["hit"])
         df  = df[df["hit"].notna()]
 
-        if len(df) < 50:
+        if len(df) < TRAIN_MIN_LABELED:
             print(f"❌ After clean: {len(df)} rows — abort")
+            training_status["last_error"] = f"After clean only {len(df)} rows"
             return
 
         # Label: 1 = hit, 0 = miss (supervised hit probability model)
         df["label"] = (df["hit"] == True).astype(int)
+        label_counts = df["label"].value_counts(dropna=False).to_dict()
+        if len(label_counts.keys()) < 2:
+            hits = int(label_counts.get(1, 0))
+            misses = int(label_counts.get(0, 0))
+            msg = f"single_class_dataset hits={hits} misses={misses}"
+            print(f"❌ {msg}")
+            training_status["last_error"] = msg
+            _save_fallback_profile("single_class_dataset", len(df), hits, misses)
+            return
 
         X  = df[avail].values.astype(np.float32)
         y  = df["label"].values
+        miss_reason_series = df["miss_reason"] if "miss_reason" in df.columns else pd.Series([""] * len(df))
+        miss_reason_norm = miss_reason_series.fillna("").astype(str).str.lower()
+        hard_mask = (df["label"] == 0) & (miss_reason_norm.isin(HARD_MISS_REASONS))
         sw = np.where(df["hit"].values, 1.2, 1.0)
+        sw = np.where(hard_mask.values, sw * TRAIN_HARD_MISS_BOOST, sw)
 
         scaler = StandardScaler()
         Xs     = scaler.fit_transform(X)
@@ -638,6 +722,10 @@ async def _startup():
             print(f"✅ DB probe OK | total rows: {total}")
         except Exception as e:
             print(f"⚠️  DB probe: {e}")
+    if PERIODIC_TRAIN_ENABLED:
+        t = threading.Thread(target=_periodic_training_loop, daemon=True)
+        t.start()
+        print(f"✅ Periodic trainer enabled | interval={PERIODIC_TRAIN_INTERVAL_SEC}s")
 
 # ============================================================
 # ENDPOINTS
@@ -759,9 +847,12 @@ async def analyze_ep(request: Request, bg: BackgroundTasks):
     valid, _ = _validate(feat)
     pred = (_ml_predict(feat) if (AI_MODEL and valid) else None) or _heuristic(feat)
 
-    if valid:
-        shot_id = str(uuid.uuid4())
-        bg.add_task(_db_insert, _build_payload(shot_id, feat, pred, data))
+    global analyze_counter
+    if valid and ANALYZE_DB_WRITE:
+        analyze_counter += 1
+        if analyze_counter % ANALYZE_DB_EVERY_N == 0:
+            shot_id = str(uuid.uuid4())
+            bg.add_task(_db_insert, _build_payload(shot_id, feat, pred, data))
 
     conf = pred["confidence"]
     # bf_phase strings MUST match Lua combobox options exactly
@@ -813,6 +904,10 @@ async def training_status_ep():
         "last_cv": round(float(training_status.get("last_cv", 0.0)), 4),
         "last_samples": int(training_status.get("last_samples", 0)),
         "last_labeled_seen": int(last_train_labeled),
+        "periodic_train_enabled": PERIODIC_TRAIN_ENABLED,
+        "periodic_train_interval_sec": PERIODIC_TRAIN_INTERVAL_SEC,
+        "train_min_labeled": TRAIN_MIN_LABELED,
+        "train_max_rows": TRAIN_MAX_ROWS,
     })
 
 
