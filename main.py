@@ -39,6 +39,10 @@ app = FastAPI(title="$hematic AI Backend", version="4.0.0")
 # ============================================================
 SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://qpymjauuxmkhgtrfetts.supabase.co")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "sb_secret_c_w2VtdiQUGeyqjuxk294A_RUmkrvco")
+AUTO_TRAIN_ENABLED = os.environ.get("AUTO_TRAIN_ENABLED", "1") == "1"
+AUTO_TRAIN_EVERY = max(10, int(os.environ.get("AUTO_TRAIN_EVERY", "120")))
+AUTO_TRAIN_MIN_LABELED = max(30, int(os.environ.get("AUTO_TRAIN_MIN_LABELED", "120")))
+AUTO_TRAIN_COOLDOWN_SEC = max(60, int(os.environ.get("AUTO_TRAIN_COOLDOWN_SEC", "300")))
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -59,7 +63,7 @@ async def _exc(request: Request, exc: Exception):
 # SCHEMA — add columns here when extending Supabase table
 # ============================================================
 DB_COLUMNS = {
-    "id", "created_at", "shot_id", "steam_id",
+    "id", "created_at", "shot_id", "lua_shot_id", "steam_id", "discord_id",
     "hit", "damage_dealt", "miss_reason", "hitgroup",
     # resolver state
     "miss_streak", "resolver_mode", "bf_phase", "weapon", "confidence", "prediction_source",
@@ -97,12 +101,52 @@ player_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=32))
 
 # Cached CV accuracy from last training run
 last_cv_accuracy: float = 0.0
+last_train_at_ts: float = 0.0
+last_train_labeled: int = 0
+last_training_trigger: str = "startup"
+
+training_status = {
+    "in_progress": False,
+    "last_trigger": "startup",
+    "last_started_at": None,
+    "last_finished_at": None,
+    "last_error": None,
+    "last_cv": 0.0,
+    "last_samples": 0,
+}
+
+prediction_metrics = {
+    "total": 0,
+    "ml_used": 0,
+    "heuristic_used": 0,
+    "invalid_telemetry": 0,
+}
 
 def _resolve_sid(lua_id: str) -> str:
     """Map Lua integer shot id → stable UUID for this server session."""
     if lua_id not in shot_id_map:
         shot_id_map[lua_id] = str(uuid.uuid4())
     return shot_id_map[lua_id]
+
+
+def _is_uuid(v: str) -> bool:
+    try:
+        uuid.UUID(str(v))
+        return True
+    except Exception:
+        return False
+
+
+def _count_labeled_records() -> int:
+    local_labeled = sum(1 for r in memory_store if r.get("hit") is not None)
+    if not supabase:
+        return local_labeled
+    try:
+        r = supabase.table("resolver_data").select("id", count="exact") \
+                    .not_.is_("hit", "null").limit(1).execute()
+        return max(local_labeled, r.count or 0)
+    except Exception:
+        return local_labeled
 
 # ============================================================
 # MODEL
@@ -263,11 +307,9 @@ def _ml_predict(feat: dict) -> dict | None:
         proba = AI_MODEL.predict_proba(X)[0]
         idx   = int(np.argmax(proba))
         conf  = float(proba[idx])
-        # classes_: [0=left, 1=right]  →  side: 0→-58, 1→+58
-        side  = 58.0 if AI_MODEL.classes_[idx] == 1 else -58.0
-        miss  = feat["miss_streak"]
+        miss = feat["miss_streak"]
         return {
-            "predicted_side": side,
+            "hit_probability": conf,
             "force_baim":     (conf < 0.55 and miss >= 2) or miss >= 5,
             "confidence":     round(conf, 4),
             "source":         "gbm",
@@ -277,9 +319,19 @@ def _ml_predict(feat: dict) -> dict | None:
         return None
 
 def _predict(data: dict, steam_id: str = "") -> tuple[dict, dict]:
-    feat   = extract_features(data)
-    result = _ml_predict(feat) or _heuristic(feat, steam_id)
-    return result, feat
+    feat = extract_features(data)
+    h = _heuristic(feat, steam_id)
+    m = _ml_predict(feat)
+
+    if m:
+        prediction_metrics["ml_used"] += 1
+        h["confidence"] = round(max(float(h.get("confidence", 0)), float(m.get("confidence", 0))), 4)
+        h["force_baim"] = bool(h.get("force_baim") or m.get("force_baim"))
+        h["source"] = "gbm+heuristic"
+        return h, feat
+
+    prediction_metrics["heuristic_used"] += 1
+    return h, feat
 
 # ============================================================
 # DATABASE
@@ -326,13 +378,13 @@ def _db_outcome(shot_id: str, hit: bool, damage: int, reason: str,
                 hitgroup: int, fallback: dict | None, lua_id: str | None = None):
     upd = {"hit": hit, "damage_dealt": int(damage),
            "miss_reason": str(reason), "hitgroup": int(hitgroup)}
+    rows = 0
     if supabase:
         try:
             res  = supabase.table("resolver_data").update(upd).eq("shot_id", shot_id).execute()
             rows = len(res.data) if res.data else 0
-            # Retry with lua integer string (race: outcome before predict)
-            if rows == 0 and lua_id and lua_id != shot_id:
-                res2 = supabase.table("resolver_data").update(upd).eq("shot_id", lua_id).execute()
+            if rows == 0 and lua_id:
+                res2 = supabase.table("resolver_data").update(upd).eq("lua_shot_id", lua_id).execute()
                 rows = len(res2.data) if res2.data else 0
             print(f"{'✅ HIT' if hit else '❌ MISS'} | shot={shot_id[:8]} | dmg={damage} | rows={rows}")
             if rows == 0:
@@ -343,12 +395,22 @@ def _db_outcome(shot_id: str, hit: bool, damage: int, reason: str,
                 print(f"⏳ Queued outcome | lua={key} (predict not yet arrived)")
         except Exception as e:
             print(f"🔥 DB outcome: {e}")
+    if rows == 0 and fallback:
+        rec = dict(fallback)
+        rec.update(upd)
+        _db_insert(rec)
     for rec in memory_store:
-        if rec.get("shot_id") in (shot_id, lua_id):
+        if rec.get("shot_id") in (shot_id, lua_id) or rec.get("lua_shot_id") in (lua_id, shot_id):
             rec.update(upd)
             break
     pending_shots.pop(shot_id, None)
-    if lua_id: pending_shots.pop(lua_id, None)
+    if AUTO_TRAIN_ENABLED and not TRAINING_IN_PROGRESS:
+        labeled_now = _count_labeled_records()
+        now = time.time()
+        if labeled_now >= AUTO_TRAIN_MIN_LABELED and \
+           labeled_now - last_train_labeled >= AUTO_TRAIN_EVERY and \
+           now - last_train_at_ts >= AUTO_TRAIN_COOLDOWN_SEC:
+            _start_training("auto_outcome")
 
 def _fallback_rec(shot_id: str, hit: bool, damage: int, reason: str) -> dict:
     now = datetime.now(timezone.utc).isoformat()
@@ -358,17 +420,26 @@ def _fallback_rec(shot_id: str, hit: bool, damage: int, reason: str) -> dict:
         base[k] = 0 if k in _INT_COLS else 0.0
     return base
 
-def _build_payload(shot_id: str, feat: dict, pred: dict, data: dict) -> dict:
+def _build_payload(shot_id: str, feat: dict, pred: dict, data: dict, lua_shot_id: str = "") -> dict:
     cfg = data.get("config") or {}
     lp  = data.get("local_player") or {}
     tgt = data.get("target") or {}
+    user = data.get("user") or {}
+    discord_id = str(
+        user.get("discord_id")
+        or cfg.get("discord_id")
+        or tgt.get("discord_id")
+        or ""
+    )
     return {
         "shot_id":           shot_id,
+        "lua_shot_id":       str(lua_shot_id or ""),
         "hit":               None,
         "damage_dealt":      None,
         "miss_reason":       None,
         "hitgroup":          None,
         "steam_id":          str(tgt.get("steam_id") or ""),
+        "discord_id":        discord_id,
         "miss_streak":       feat["miss_streak"],
         "choked_ticks":      feat["choked_ticks"],
         "velocity_x":        feat["velocity_x"],
@@ -412,11 +483,63 @@ def _cleanup_pending():
     for k in stale_out:
         pending_outcomes.pop(k, None)
 
+
+def _save_model_artifacts(cv_mean: float, n_samples: int, trigger: str, features: list[str]):
+    if not supabase:
+        return
+    snapshot_id = None
+    try:
+        snap = {
+            "model_version": "resolver_ai_v4",
+            "cv_accuracy": float(cv_mean),
+            "n_samples": int(n_samples),
+            "features_json": {"features": features, "trigger": trigger},
+            "notes": f"auto={AUTO_TRAIN_ENABLED} trigger={trigger}",
+        }
+        r = supabase.table("model_snapshots").insert(snap).execute()
+        if r.data and len(r.data) > 0:
+            snapshot_id = r.data[0].get("id")
+    except Exception as e:
+        print(f"⚠️ snapshot save: {e}")
+
+    try:
+        settings = {
+            "resolver_mode": "Neural AI" if cv_mean >= 0.58 else "Adaptive",
+            "bf_phase": "[3] Phase 3 (Custom)" if cv_mean >= 0.75 else "[2] Phase 2 (Aggressive)" if cv_mean >= 0.62 else "[1] Phase 1 (Adaptive)",
+            "min_confidence": round(float(cv_mean) * 100, 1),
+        }
+        p = {
+            "source_model_snapshot_id": snapshot_id,
+            "settings_json": settings,
+            "is_active": True,
+            "effective_from": datetime.now(timezone.utc).isoformat(),
+        }
+        supabase.table("resolver_profiles").update({"is_active": False}).eq("is_active", True).execute()
+        supabase.table("resolver_profiles").insert(p).execute()
+    except Exception as e:
+        print(f"⚠️ profile save: {e}")
+
+
+def _start_training(trigger: str) -> bool:
+    global TRAINING_IN_PROGRESS
+    with TRAINING_LOCK:
+        if TRAINING_IN_PROGRESS:
+            return False
+        TRAINING_IN_PROGRESS = True
+        training_status["in_progress"] = True
+        training_status["last_trigger"] = trigger
+        training_status["last_started_at"] = datetime.now(timezone.utc).isoformat()
+        training_status["last_error"] = None
+    t = threading.Thread(target=_train_bg, args=(trigger,), daemon=True)
+    t.start()
+    return True
+
 # ============================================================
 # TRAINING
 # ============================================================
-def _train_bg():
+def _train_bg(trigger: str = "manual"):
     global AI_MODEL, SCALER, TRAINING_IN_PROGRESS, last_cv_accuracy
+    global last_train_at_ts, last_train_labeled, last_training_trigger
     try:
         from sklearn.ensemble import GradientBoostingClassifier
         from sklearn.preprocessing import StandardScaler
@@ -438,6 +561,10 @@ def _train_bg():
             return
 
         df  = pd.DataFrame(records)
+        if "shot_id" in df.columns:
+            df["shot_id"] = df["shot_id"].astype(str)
+            df = df.sort_values("created_at") if "created_at" in df.columns else df
+            df = df.drop_duplicates(subset=["shot_id"], keep="last")
         avail = [f for f in FEATURES if f in df.columns]
         df  = df.dropna(subset=avail + ["hit"])
         df  = df[df["hit"].notna()]
@@ -446,16 +573,12 @@ def _train_bg():
             print(f"❌ After clean: {len(df)} rows — abort")
             return
 
-        # Label: 1=right (+58 side hit), 0=left
-        # We derive side from goal_feet_yaw sign if available, else from hit flag only
-        if "desync_delta" in df.columns:
-            df["label"] = ((df["hit"] == True) & (df["desync_delta"] >= 0)).astype(int)
-        else:
-            df["label"] = df["hit"].astype(int)
+        # Label: 1 = hit, 0 = miss (supervised hit probability model)
+        df["label"] = (df["hit"] == True).astype(int)
 
         X  = df[avail].values.astype(np.float32)
         y  = df["label"].values
-        sw = np.where(df["hit"].values, 1.5, 1.0)  # weight hits slightly more
+        sw = np.where(df["hit"].values, 1.2, 1.0)
 
         scaler = StandardScaler()
         Xs     = scaler.fit_transform(X)
@@ -478,6 +601,9 @@ def _train_bg():
         print("📊 " + " | ".join(f"{n}={v:.3f}" for n, v in top))
 
         last_cv_accuracy = cv_mean
+        last_train_at_ts = time.time()
+        last_train_labeled = _count_labeled_records()
+        last_training_trigger = trigger
         joblib.dump({
             "model": model, "scaler": scaler, "features": avail,
             "cv_accuracy": cv_mean, "n_samples": len(df),
@@ -485,13 +611,19 @@ def _train_bg():
         }, MODEL_PATH)
         AI_MODEL = model
         SCALER   = scaler
+        _save_model_artifacts(cv_mean, len(df), trigger, avail)
+        training_status["last_cv"] = cv_mean
+        training_status["last_samples"] = int(len(df))
         print("✅ Model saved")
 
     except Exception as e:
         print(f"❌ Training: {e}")
+        training_status["last_error"] = str(e)
         import traceback; traceback.print_exc()
     finally:
         TRAINING_IN_PROGRESS = False
+        training_status["in_progress"] = False
+        training_status["last_finished_at"] = datetime.now(timezone.utc).isoformat()
 
 # ============================================================
 # STARTUP
@@ -534,6 +666,7 @@ async def predict_ep(request: Request, bg: BackgroundTasks):
         return JSONResponse(status_code=400, content={"error": "bad json"})
 
     _cleanup_pending()
+    prediction_metrics["total"] += 1
 
     lua_id   = str(data.get("shot_id") or "")
     shot_id  = _resolve_sid(lua_id) if lua_id else str(uuid.uuid4())
@@ -544,6 +677,7 @@ async def predict_ep(request: Request, bg: BackgroundTasks):
     valid, inv_rsn = _validate(feat)
 
     if not valid:
+        prediction_metrics["invalid_telemetry"] += 1
         print(f"⚠️  Bad telemetry [{lua_id}]: {inv_rsn}")
         res = _heuristic(feat, steam_id)
         res["shot_id"] = shot_id
@@ -551,9 +685,9 @@ async def predict_ep(request: Request, bg: BackgroundTasks):
         return JSONResponse(res)
 
     pred, feat = _predict(data, steam_id)
-    payload    = _build_payload(shot_id, feat, pred, data)
+    payload    = _build_payload(shot_id, feat, pred, data, lua_id)
 
-    pending_shots[shot_id] = {"ts": time.time(), "payload": payload}
+    pending_shots[shot_id] = {"ts": time.time(), "payload": payload, "lua_id": lua_id, "uuid": shot_id}
     # Insert synchronously so row exists before we check pending_outcomes below
     _db_insert(payload)
 
@@ -591,10 +725,7 @@ async def outcome_ep(request: Request, bg: BackgroundTasks):
         return JSONResponse({"status": "ignored"})
 
     # Resolve UUID: try shot_id_map with both raw_id and lua_id
-    shot_id = (shot_id_map.get(raw_id)
-               or shot_id_map.get(lua_id)
-               or pending_shots.get(lua_id, {}).get("uuid")
-               or raw_id)
+    shot_id = raw_id if _is_uuid(raw_id) else (shot_id_map.get(raw_id) or shot_id_map.get(lua_id) or raw_id)
 
     hit      = bool(data.get("hit", False))
     damage   = int(data.get("damage") or 0)
@@ -608,7 +739,7 @@ async def outcome_ep(request: Request, bg: BackgroundTasks):
                 break
 
     # Try to find pending payload by UUID or lua integer
-    pending  = pending_shots.get(shot_id) or pending_shots.get(lua_id)
+    pending  = pending_shots.get(shot_id)
     fallback = pending["payload"] if pending else None
 
     # Pass lua_id so _db_outcome can retry with integer if UUID row not found
@@ -642,7 +773,7 @@ async def analyze_ep(request: Request, bg: BackgroundTasks):
         bf = "[1] Phase 1 (Adaptive)"
     return JSONResponse({
         "bf_phase":       bf,
-        "resolver_mode":  "Neural AI" if pred["source"] == "gbm" else "Adaptive",
+        "resolver_mode":  "Neural AI" if str(pred.get("source", "")).find("gbm") != -1 else "Adaptive",
         "override_baim":  pred["force_baim"],
         "confidence":     conf,
     })
@@ -650,7 +781,6 @@ async def analyze_ep(request: Request, bg: BackgroundTasks):
 
 @app.post("/train")
 async def train_ep(bg: BackgroundTasks):
-    global TRAINING_IN_PROGRESS
     if TRAINING_IN_PROGRESS:
         return JSONResponse({"status": "busy"})
     total   = len(memory_store)
@@ -665,12 +795,119 @@ async def train_ep(bg: BackgroundTasks):
                         .not_.is_("hit", "null").limit(1).execute()
             labeled = max(labeled, r.count or 0)
         except: pass
-    TRAINING_IN_PROGRESS = True
-    bg.add_task(_train_bg)
+    started = _start_training("manual_api")
     return JSONResponse({
-        "status": "started", "total": total, "labeled": labeled,
+        "status": "started" if started else "busy", "total": total, "labeled": labeled,
         "has_model": AI_MODEL is not None,
     })
+
+
+@app.get("/training/status")
+async def training_status_ep():
+    return JSONResponse({
+        "in_progress": TRAINING_IN_PROGRESS,
+        "last_trigger": training_status.get("last_trigger"),
+        "last_started_at": training_status.get("last_started_at"),
+        "last_finished_at": training_status.get("last_finished_at"),
+        "last_error": training_status.get("last_error"),
+        "last_cv": round(float(training_status.get("last_cv", 0.0)), 4),
+        "last_samples": int(training_status.get("last_samples", 0)),
+        "last_labeled_seen": int(last_train_labeled),
+    })
+
+
+@app.get("/profile/active")
+async def active_profile_ep():
+    if not supabase:
+        return JSONResponse({"status": "no_db", "settings": {}})
+    try:
+        r = supabase.table("resolver_profiles").select("*") \
+                    .eq("is_active", True).order("created_at", desc=True).limit(1).execute()
+        row = (r.data or [{}])[0] if r.data else {}
+        return JSONResponse({
+            "status": "ok" if row else "empty",
+            "settings": row.get("settings_json") or {},
+            "source_model_snapshot_id": row.get("source_model_snapshot_id"),
+            "effective_from": row.get("effective_from") or row.get("created_at"),
+        })
+    except Exception as e:
+        return JSONResponse({"status": "error", "error": str(e), "settings": {}})
+
+
+@app.get("/profile/{discord_id}")
+async def user_profile_ep(discord_id: str):
+    did = str(discord_id or "").strip()
+    if did == "":
+        return JSONResponse(status_code=400, content={"error": "discord_id required"})
+
+    total_sent = 0
+    labeled = 0
+    hits = 0
+    avg_conf = 0.0
+    recent = []
+
+    local_rows = [r for r in memory_store if str(r.get("discord_id") or "") == did]
+    if local_rows:
+        total_sent = len(local_rows)
+        labeled = sum(1 for r in local_rows if r.get("hit") is not None)
+        hits = sum(1 for r in local_rows if r.get("hit") is True)
+        conf_vals = [float(r.get("confidence") or 0.0) for r in local_rows]
+        avg_conf = (sum(conf_vals) / len(conf_vals)) if conf_vals else 0.0
+        recent = local_rows[-5:]
+
+    if supabase:
+        try:
+            r_total = supabase.table("resolver_data").select("id", count="exact") \
+                .eq("discord_id", did).limit(1).execute()
+            total_sent = max(total_sent, r_total.count or 0)
+        except Exception:
+            pass
+        try:
+            r_lab = supabase.table("resolver_data").select("id", count="exact") \
+                .eq("discord_id", did).not_.is_("hit", "null").limit(1).execute()
+            labeled = max(labeled, r_lab.count or 0)
+        except Exception:
+            pass
+        try:
+            r_hit = supabase.table("resolver_data").select("id", count="exact") \
+                .eq("discord_id", did).eq("hit", True).limit(1).execute()
+            hits = max(hits, r_hit.count or 0)
+        except Exception:
+            pass
+        try:
+            r_conf = supabase.table("resolver_data").select("confidence") \
+                .eq("discord_id", did).order("created_at", desc=True).limit(200).execute()
+            rows_conf = r_conf.data or []
+            if rows_conf:
+                vals = [float(x.get("confidence") or 0.0) for x in rows_conf]
+                avg_conf = sum(vals) / len(vals)
+        except Exception:
+            pass
+        try:
+            r_recent = supabase.table("resolver_data").select("created_at,hit,damage_dealt,miss_reason,confidence,weapon,bf_phase,prediction_source") \
+                .eq("discord_id", did).order("created_at", desc=True).limit(5).execute()
+            recent = r_recent.data or recent
+        except Exception:
+            pass
+
+    hit_rate = round((hits / labeled * 100.0), 2) if labeled > 0 else 0.0
+
+    return JSONResponse({
+        "discord_id": did,
+        "shots_sent": int(total_sent),
+        "labeled_shots": int(labeled),
+        "hits": int(hits),
+        "hit_rate": hit_rate,
+        "avg_confidence": round(float(avg_conf), 2),
+        "training_in_progress": TRAINING_IN_PROGRESS,
+        "model_version": f"GBM v4 | CV={last_cv_accuracy:.3f}" if AI_MODEL else "none",
+        "recent": recent,
+    })
+
+
+@app.get("/profile")
+async def user_profile_query_ep(discord_id: str = ""):
+    return await user_profile_ep(discord_id)
 
 
 @app.get("/stats")
@@ -706,6 +943,10 @@ async def stats_ep():
         "last_sync":         datetime.now(timezone.utc).isoformat(),
         "your_contribution": "Active" if memory_store else "Inactive",
         "model_version":     f"GBM v4 | CV={last_cv_accuracy:.3f}" if AI_MODEL else "none",
+        "ml_usage_rate":     round((prediction_metrics["ml_used"] / prediction_metrics["total"] * 100) if prediction_metrics["total"] else 0.0, 2),
+        "heuristic_usage_rate": round((prediction_metrics["heuristic_used"] / prediction_metrics["total"] * 100) if prediction_metrics["total"] else 0.0, 2),
+        "invalid_telemetry_rate": round((prediction_metrics["invalid_telemetry"] / prediction_metrics["total"] * 100) if prediction_metrics["total"] else 0.0, 2),
+        "training_in_progress": TRAINING_IN_PROGRESS,
     })
 
 
