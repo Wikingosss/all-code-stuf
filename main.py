@@ -51,7 +51,7 @@ TRAIN_HARD_MISS_ROWS = max(200, int(os.environ.get("TRAIN_HARD_MISS_ROWS", "2500
 TRAIN_HARD_MISS_BOOST = max(1.0, float(os.environ.get("TRAIN_HARD_MISS_BOOST", "1.6")))
 ANALYZE_DB_WRITE = os.environ.get("ANALYZE_DB_WRITE", "0") == "1"
 ANALYZE_DB_EVERY_N = max(1, int(os.environ.get("ANALYZE_DB_EVERY_N", "20")))
-LOGO_GITHUB_RAW_BASE = os.environ.get("LOGO_GITHUB_RAW_BASE", "https://raw.githubusercontent.com/Wikingosss/lua-/main").rstrip("/")
+LOGO_GITHUB_RAW_BASE = os.environ.get("LOGO_GITHUB_RAW_BASE", "https://raw.githubusercontent.com/Wikingosss/all-code-stuf/main").rstrip("/")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
