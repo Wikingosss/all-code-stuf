@@ -787,6 +787,7 @@ async def presence_heartbeat_ep(request: Request):
     user_id = str(data.get("user_id") or data.get("discord_id") or "").strip()
     map_name = str(data.get("map") or "").strip()
     version = str(data.get("version") or "").strip()
+    player_name = str(data.get("player_name") or "").strip()
     now = time.time()
 
     presence_store[steam_id] = {
@@ -794,6 +795,7 @@ async def presence_heartbeat_ep(request: Request):
         "user_id": user_id,
         "map": map_name,
         "version": version,
+        "player_name": player_name,
         "last_seen": now,
     }
     _presence_cleanup(now)
@@ -819,6 +821,10 @@ async def presence_list_ep(request: Request):
     if not isinstance(raw, list):
         return JSONResponse(status_code=400, content={"error": "steam_ids must be list"})
 
+    raw_names = data.get("player_names") or []
+    if not isinstance(raw_names, list):
+        raw_names = []
+
     in_match = []
     seen = set()
     for sid in raw:
@@ -829,6 +835,23 @@ async def presence_list_ep(request: Request):
         in_match.append(s)
 
     active_steam_ids = [sid for sid in in_match if sid in presence_store]
+
+    match_names = set()
+    for nm in raw_names:
+        n = str(nm or "").strip().lower()
+        if n:
+            match_names.add(n)
+
+    active_player_names = []
+    if match_names:
+        seen_names = set()
+        for row in presence_store.values():
+            nm = str(row.get("player_name") or "").strip()
+            key = nm.lower()
+            if key and key in match_names and key not in seen_names:
+                seen_names.add(key)
+                active_player_names.append(nm)
+
     users = {}
     for sid in active_steam_ids:
         row = presence_store.get(sid) or {}
@@ -836,12 +859,14 @@ async def presence_list_ep(request: Request):
             "user_id": str(row.get("user_id") or ""),
             "map": str(row.get("map") or ""),
             "version": str(row.get("version") or ""),
+            "player_name": str(row.get("player_name") or ""),
             "last_seen": float(row.get("last_seen") or 0.0),
         }
 
     return JSONResponse({
         "status": "ok",
         "active_steam_ids": active_steam_ids,
+        "active_player_names": active_player_names,
         "users": users,
         "online_total": len(presence_store),
         "ttl_sec": PRESENCE_TTL_SEC,
