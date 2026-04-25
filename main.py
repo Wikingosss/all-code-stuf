@@ -26,7 +26,7 @@ import joblib
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, RedirectResponse
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -51,6 +51,7 @@ TRAIN_HARD_MISS_ROWS = max(200, int(os.environ.get("TRAIN_HARD_MISS_ROWS", "2500
 TRAIN_HARD_MISS_BOOST = max(1.0, float(os.environ.get("TRAIN_HARD_MISS_BOOST", "1.6")))
 ANALYZE_DB_WRITE = os.environ.get("ANALYZE_DB_WRITE", "0") == "1"
 ANALYZE_DB_EVERY_N = max(1, int(os.environ.get("ANALYZE_DB_EVERY_N", "20")))
+LOGO_GITHUB_RAW_BASE = os.environ.get("LOGO_GITHUB_RAW_BASE", "https://raw.githubusercontent.com/Wikingosss/lua-/main").rstrip("/")
 
 supabase: Client = None
 if SUPABASE_URL and SUPABASE_KEY:
@@ -107,6 +108,9 @@ pending_outcomes: dict[str, dict] = {} # lua_id → {upd, ts}
 # Per-steam_id hit/miss side history — core of heuristic
 player_history: dict[str, deque] = defaultdict(lambda: deque(maxlen=32))
 
+presence_store: dict[str, dict] = {}
+PRESENCE_TTL_SEC = max(10, int(os.environ.get("PRESENCE_TTL_SEC", "45")))
+
 # Cached CV accuracy from last training run
 last_cv_accuracy: float = 0.0
 last_train_at_ts: float = 0.0
@@ -148,6 +152,17 @@ def _is_uuid(v: str) -> bool:
         return True
     except Exception:
         return False
+
+
+def _presence_cleanup(now_ts: float | None = None) -> None:
+    now = now_ts if isinstance(now_ts, (int, float)) else time.time()
+    expired = []
+    for sid, row in presence_store.items():
+        ts = float(row.get("last_seen") or 0.0)
+        if (now - ts) > PRESENCE_TTL_SEC:
+            expired.append(sid)
+    for sid in expired:
+        presence_store.pop(sid, None)
 
 
 def _count_labeled_records() -> int:
@@ -733,12 +748,104 @@ async def _startup():
 
 @app.get("/")
 async def root():
+    _presence_cleanup()
     return {
         "status":   "$hematic AI Backend v4.0",
         "model":    f"GBM | CV={last_cv_accuracy:.3f}" if AI_MODEL else "heuristic-only",
         "records":  len(memory_store),
         "pending":  len(pending_shots),
+        "presence_online": len(presence_store),
     }
+
+
+@app.get("/logo")
+async def logo_default_ep():
+    return RedirectResponse(url=f"{LOGO_GITHUB_RAW_BASE}/shematiclogo.png", status_code=307)
+
+
+@app.get("/logo/{filename}")
+async def logo_file_ep(filename: str):
+    name = str(filename or "").strip()
+    if name == "" or ".." in name or "/" in name or "\\" in name:
+        return JSONResponse(status_code=400, content={"error": "invalid filename"})
+    if not name.lower().endswith(".png"):
+        return JSONResponse(status_code=400, content={"error": "only .png allowed"})
+    return RedirectResponse(url=f"{LOGO_GITHUB_RAW_BASE}/{name}", status_code=307)
+
+
+@app.post("/presence/heartbeat")
+async def presence_heartbeat_ep(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "bad json"})
+
+    steam_id = str(data.get("steam_id") or "").strip()
+    if steam_id == "" or steam_id == "0":
+        return JSONResponse(status_code=400, content={"error": "steam_id required"})
+
+    user_id = str(data.get("user_id") or data.get("discord_id") or "").strip()
+    map_name = str(data.get("map") or "").strip()
+    version = str(data.get("version") or "").strip()
+    now = time.time()
+
+    presence_store[steam_id] = {
+        "steam_id": steam_id,
+        "user_id": user_id,
+        "map": map_name,
+        "version": version,
+        "last_seen": now,
+    }
+    _presence_cleanup(now)
+
+    return JSONResponse({
+        "status": "ok",
+        "steam_id": steam_id,
+        "ttl_sec": PRESENCE_TTL_SEC,
+        "online": len(presence_store),
+    })
+
+
+@app.post("/presence/list")
+async def presence_list_ep(request: Request):
+    try:
+        data = await request.json()
+    except Exception:
+        return JSONResponse(status_code=400, content={"error": "bad json"})
+
+    _presence_cleanup()
+
+    raw = data.get("steam_ids") or []
+    if not isinstance(raw, list):
+        return JSONResponse(status_code=400, content={"error": "steam_ids must be list"})
+
+    in_match = []
+    seen = set()
+    for sid in raw:
+        s = str(sid or "").strip()
+        if s == "" or s == "0" or s in seen:
+            continue
+        seen.add(s)
+        in_match.append(s)
+
+    active_steam_ids = [sid for sid in in_match if sid in presence_store]
+    users = {}
+    for sid in active_steam_ids:
+        row = presence_store.get(sid) or {}
+        users[sid] = {
+            "user_id": str(row.get("user_id") or ""),
+            "map": str(row.get("map") or ""),
+            "version": str(row.get("version") or ""),
+            "last_seen": float(row.get("last_seen") or 0.0),
+        }
+
+    return JSONResponse({
+        "status": "ok",
+        "active_steam_ids": active_steam_ids,
+        "users": users,
+        "online_total": len(presence_store),
+        "ttl_sec": PRESENCE_TTL_SEC,
+    })
 
 
 @app.post("/predict")
